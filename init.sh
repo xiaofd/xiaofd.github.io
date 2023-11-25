@@ -20,7 +20,7 @@ if [[ -z `tmux ls | grep init` ]] ; then
   tmux attach -t "init"
 else
   ## 安装些组件
-  apt install -y net-tools dnsutils curl wget tmux vim git net-tools iperf3
+  apt install -y net-tools dnsutils curl wget tmux vim git net-tools iperf3 fuse3
   git config --global user.email "jun@jun.ac.cn"
   git config --global user.name "xiaofd"
 
