@@ -695,10 +695,10 @@ echo '' >>/target/etc/crontab; \
 echo '#!/bin/sh -e' >/target/etc/run.sh; \
 echo '#set zh_CN and timezone' >>/target/etc/run.sh; \
 echo '#wget xiaofd.github.io/anaconda3.sh && bash anaconda3.sh' >>/target/etc/run.sh; \
-echo 'apt-get update && apt-get install -y curl wget tmux language-pack-zh-*' >>/target/etc/run.sh; \
-echo 'echo "export LANG=zh_CN.utf-8" >> /root/.bashrc' >>/target/etc/run.sh; \
-echo 'locale-gen' >>/target/etc/run.sh; \
-echo 'update-locale' >>/target/etc/run.sh; \
+echo 'apt-get update && apt-get install -y curl wget tmux' >>/target/etc/run.sh; \
+echo '#echo "apt-get install language-pack-zh-* && export LANG=zh_CN.utf-8" >> /root/.bashrc' >>/target/etc/run.sh; \
+echo '#locale-gen' >>/target/etc/run.sh; \
+echo '#update-locale' >>/target/etc/run.sh; \
 echo 'cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime' >>/target/etc/run.sh; \
 echo '${setCMD}' >>/target/etc/run.sh; \
 echo 'exit 0' >>/target/etc/run.sh; 
