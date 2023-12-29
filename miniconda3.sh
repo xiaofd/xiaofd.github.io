@@ -21,3 +21,4 @@ rm -f anaconda3-install.sh
 #source /etc/profile
 ~/conda/bin/conda init
 source ~/.bashrc
+source ~/.profile
