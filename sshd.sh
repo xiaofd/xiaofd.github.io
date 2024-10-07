@@ -5,6 +5,7 @@ sed -i "s#^.*Port .*#Port 3927#g" /etc/ssh/sshd_config
 if test -z "`cat /etc/ssh/sshd_config | grep "^PasswordAuthentication no$"`" ; then
     echo "Disable the password login method."
     echo -e "\nPasswordAuthentication no" >> /etc/ssh/sshd_config
+    echo -e "\nAuthenticationMethods publickey" >> /etc/ssh/sshd_config  # 强制所有用户只使用publickey
 else
     echo "Already disable the password."
 fi
