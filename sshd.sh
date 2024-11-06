@@ -20,4 +20,8 @@ echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCfuo9/cfgAHy8HYEGVxY+wklHlnrAQ0bPsz6
 #[ -z "`cat /etc/issue | grep CentOS`" ] && service ssh restart
 service --status-all | grep ssh && service ssh restart
 systemctl restart ssh
+systemctl mask ssh.socket
+systemctl mask sshd.socket
+systemctl disable sshd
+systemctl enable ssh
 echo "sshd config is done!"
