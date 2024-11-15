@@ -1,7 +1,7 @@
+# -*- coding: utf-8 -*-
 #!/bin/bash
 ## 自用 ubuntu 初装init
 ## wget xiaofd.github.io/init.sh && bash init.sh
-
 function _apt_install(){
   pkg="$1"
   [[ -z `which "$pkg"` ]] && apt install -y "$pkg"
@@ -46,12 +46,19 @@ else
 
   elif [[ -n `cat /etc/issue | grep "Debian"` ]] ; then
     sed -i '/^alias ll=*/d' ~/.bashrc
-    echo "alias ll='ls -l --color=auto'" >>~/.bashrc
-    
+    echo "alias ll='ls -l --color=auto'" >> ~/.bashrc
+    sed -i '/^export LANG=/d' ~/.bashrc
+    echo "export LANG=zh_CN.UTF-8" >> ~/.bashrc
+    #touch ~/.vimrc
+    #[[ -z $(grep "set encoding=utf-8" "$HOME/.vimrc") ]] && echo "set encoding=utf-8" #>> "$HOME/.vimrc"
+    #[[ -z $(grep "set fileencodings=utf-8,gbk,gb2312" "$HOME/.vimrc") ]] && echo "set fileencodings=utf-8,gbk,gb2312" #>> "$HOME/.vimrc"
+ 
     apt install fonts-wqy-zenhei
     echo "zh_CN.UTF-8 UTF-8" > /etc/locale.gen
     locale-gen
     update-locale LANG=zh_CN.UTF-8
+
+
   fi
 
 
