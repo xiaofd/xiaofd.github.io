@@ -2,6 +2,7 @@
 # Netout Gateway
 NetoutGateway='192.168.0.11'
 NetdefGateway='192.168.0.1'
+NetoutGateway6='fdf7:a100:557::1'
 
 [[ -z $(which docker) ]] && echo "Install Docker......" && wget -qO- get.docker.com | bash
 [[ -z $(which iptables) ]] && echo "Install Iptables......" && apt update && apt install -y iptables net-tools
@@ -36,7 +37,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'ip route add default via ${NetoutGateway} dev ${NetDevice} table table_1; ip route add default via ${NetdefGateway} dev ${NetDevice} table table_2; ip rule add from 192.168.1.0/24 iif $(ip route | grep 192.168.1.0 | awk "{print \$3}") lookup table_1; ip rule add from 192.168.2.0/24 iif $(ip route | grep 192.168.2.0 | awk "{print \$3}") lookup table_2;sudo ip -6 rule add from 2001:db8:1::/64 iif $(ip -6 route | grep 2001:db8:1:: | awk '{print $3}') lookup table_1;sudo ip -6 rule add from 2001:db8:2::/64 iif $(ip -6 route | grep 2001:db8:2:: | awk '{print $3}') lookup table_2'
+ExecStart=/bin/bash -c 'ip route add default via ${NetoutGateway} dev ${NetDevice} table table_1; ip -6 route add default via ${NetoutGateway6} dev ${NetDevice} table table_1; ip route add default via ${NetdefGateway} dev ${NetDevice} table table_2; ip rule add from 192.168.1.0/24 iif $(ip route | grep 192.168.1.0 | awk "{print \$3}") lookup table_1; ip rule add from 192.168.2.0/24 iif $(ip route | grep 192.168.2.0 | awk "{print \$3}") lookup table_2;sudo ip -6 rule add from 2001:db8:1::/64 iif $(ip -6 route | grep 2001:db8:1:: | awk '{print $3}') lookup table_1;sudo ip -6 rule add from 2001:db8:2::/64 iif $(ip -6 route | grep 2001:db8:2:: | awk '{print $3}') lookup table_2'
 RemainAfterExit=true
 ExecStop=/bin/bash -c 'ip rule del from 192.168.1.0/24 iif $(ip route | grep 192.168.1.0 | awk "{print \$3}") lookup table_1; ip rule del from 192.168.2.0/24 iif $(ip route | grep 192.168.2.0 | awk "{print \$3}") lookup table_2; sudo ip -6 rule del from 2001:db8:1::/64 iif $(ip -6 route | grep 2001:db8:1:: | awk '{print $3}') lookup table_1; sudo ip -6 rule del from 2001:db8:2::/64 iif $(ip -6 route | grep 2001:db8:2:: | awk '{print $3}') lookup table_2'
 
