@@ -20,8 +20,8 @@ if [[ -z `tmux ls | grep init` ]] ; then
   tmux attach -t "init"
 else
   ## 安装些组件
-  apt install -y net-tools dnsutils curl wget tmux vim git net-tools iperf3 fuse3 p7zip-full
-  git config --global user.email "jun@jun.ac.cn"
+  apt install -y net-tools dnsutils curl wget tmux vim git net-tools iperf3 fuse3 p7zip-full locales
+  git config --global user.email "xiaofd@ac.cn"
   git config --global user.name "xiaofd"
 
   ## rclone安装
@@ -57,8 +57,9 @@ else
     echo "zh_CN.UTF-8 UTF-8" > /etc/locale.gen
     locale-gen
     update-locale LANG=zh_CN.UTF-8
-
-
+    echo 'LANG=zh_CN.UTF-8' > /etc/default/locale
+    echo 'LANGUAGE=zh_CN:zh:en_US:en' >> /etc/default/locale
+    echo 'LC_ALL=zh_CN.UTF-8' >> /etc/default/locale
   fi
 
 
