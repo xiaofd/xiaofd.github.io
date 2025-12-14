@@ -25,7 +25,7 @@ else
   git config --global user.name "xiaofd"
 
   ## rclone安装
-  [[ -z `which rclone` ]] && wget -qO- xiaofd.github.io/rclone.sh | bash
+  [[ -z `which rclone` ]] && wget -qO- xiaofd.github.io/rclone.sh | bash -s -- 9
 
   ## docker
   [[ -z `which docker` ]] && wget -qO- get.docker.com | bash
