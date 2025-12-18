@@ -9,8 +9,10 @@ import threading
 import unicodedata
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Optional
+from urllib.parse import quote
 
-from flask import Flask, request, abort, url_for, send_file, Response
+from flask import Flask, request, abort, send_file, Response
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.exceptions import RequestEntityTooLarge
 
@@ -49,7 +51,7 @@ CLEANUP_INTERVAL_SECONDS = int(os.environ.get("UD_CLEANUP_INTERVAL_SECONDS", "12
 CLAIMED_GRACE_SECONDS = int(os.environ.get("UD_CLAIMED_GRACE_SECONDS", "1800"))  # 30min
 TMP_GRACE_SECONDS = int(os.environ.get("UD_TMP_GRACE_SECONDS", "1800"))          # 30min
 
-# 反代支持：让 url_for(_external=True) 带正确 host/proto/prefix
+# 反代支持：让外部 URL 使用 X-Forwarded-* 时正常
 # 注意：ProxyFix 只应该在“前面确实有可信反代”的情况下开启
 ENABLE_PROXY_FIX = os.environ.get("UD_ENABLE_PROXY_FIX", "1") != "0"
 PROXY_FIX_X_FOR = int(os.environ.get("UD_PROXY_FIX_X_FOR", "1"))
@@ -84,6 +86,7 @@ if ENABLE_PROXY_FIX:
 # 进程内限速（多 worker 需要 Redis 才能做到全局严格）
 _last_upload_ts = {}
 _rate_lock = threading.Lock()
+_hc_count = 0
 
 # ==============================================================================
 # 工具函数
@@ -165,6 +168,11 @@ def rate_limit_upload() -> bool:
     ip = client_ip()
     now = time.time()
     with _rate_lock:
+        # 清理长期未使用的 IP 记录，避免 map 膨胀
+        cutoff = now - max(RATE_LIMIT_SECONDS, 86400)
+        for k, ts in list(_last_upload_ts.items()):
+            if ts < cutoff:
+                _last_upload_ts.pop(k, None)
         last = _last_upload_ts.get(ip, 0.0)
         remain = RATE_LIMIT_SECONDS - (now - last)
         if remain > 0:
@@ -258,6 +266,32 @@ def cleanup_tokens():
                     meta = {}
                 cleanup_pair(meta, mf)
 
+def pending_stats():
+    tokens = []
+    total_bytes = 0
+    for mf in UPLOAD_DIR.glob("*.json"):
+        if mf.name.endswith(".claimed.json"):
+            continue
+        try:
+            meta = json.loads(mf.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        token = meta.get("token") or ""
+        stored_name = meta.get("stored_name") or ""
+        download_name = meta.get("download_name") or ""
+        tokens.append({"token": token, "stored_name": stored_name, "download_name": download_name})
+    for item in tokens:
+        if not item["stored_name"]:
+            continue
+        path = (UPLOAD_DIR / item["stored_name"]).resolve()
+        if UPLOAD_DIR not in path.parents or not path.exists():
+            continue
+        try:
+            total_bytes += path.stat().st_size
+        except Exception:
+            pass
+    return {"pending_tokens": len(tokens), "pending_bytes": total_bytes}
+
 def cleanup_daemon():
     while True:
         try:
@@ -265,9 +299,6 @@ def cleanup_daemon():
         except Exception:
             pass
         time.sleep(CLEANUP_INTERVAL_SECONDS)
-
-def make_external(endpoint: str, **kwargs) -> str:
-    return url_for(endpoint, _external=True, **kwargs)
 
 # ==============================================================================
 # “像没网站”：404/405 默认空响应
@@ -290,72 +321,95 @@ def too_large(_e):
 def render_ud_page(message: str = "", level: str = "info", download_url: str = ""):
     base = request.url_root.rstrip("/")
     key_note = "需要 key 才能上传" if REQUIRE_UPLOAD_AUTH else "无需 key"
-    curl_key = "YOUR_KEY" if REQUIRE_UPLOAD_AUTH else ""
-    curl_example = f'curl -sS -F "file=@/path/to/file" "{base}/ud?key={curl_key}"'.rstrip("?key=")
+    if REQUIRE_UPLOAD_AUTH:
+        curl_example = f'curl -sS -F "file=@/path/to/file" "{base}/ud?key=YOUR_KEY"'
+    else:
+        curl_example = f'curl -sS -F "file=@/path/to/file" "{base}/ud"'
 
     if not wants_html():
-        txt = f"""UD
+        txt = f"""UD Relay
 
-GET  {base}/hc
-GET  {base}/hp
-GET  {base}/ud
-POST {base}/ud
-GET  {base}/ud/d/<token>   (one-time download, then 404)
+用途：一次性文件传输（下载一次后即失效）；仅开放 /hc /hp /ud /ud/f/... 其余为空 404
 
-curl upload:
+接口：
+  GET  {base}/hc
+  GET  {base}/hp
+  GET  {base}/ud
+  POST {base}/ud
+  GET  {base}/ud/f/<token>/<filename>
+
+curl 上传示例：
   {curl_example}
 """
         return (txt, 200, {"Content-Type": "text/plain; charset=utf-8"})
 
-    color = {"ok": "#46f2a6", "err": "#ff6b6b", "info": "#a7c5ff"}.get(level, "#a7c5ff")
+    color = {"ok": "#42f7bf", "err": "#ff7b7b", "info": "#a7c5ff"}.get(level, "#a7c5ff")
     msg_block = ""
     if message:
         msg_block = f"""
-        <div style="margin-top:12px;padding:10px 12px;border-radius:12px;
-                    background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.12);">
-          <div style="color:{color};font-weight:700;margin-bottom:6px;">{message}</div>
-          {"<div class='muted'>下载链接（一次性）：</div><div style='margin-top:6px;word-break:break-all;'><a href='"+download_url+"'>"+download_url+"</a></div>" if download_url else ""}
+        <div class="alert {'ok' if level=='ok' else 'err' if level=='err' else ''}">
+          <div class="alert-title" style="color:{color};">{message}</div>
+          {"<div class='muted'>下载链接（一次性；wget 不加参数也会落地成原文件名）：</div><div class='link-row'><a href='"+download_url+"'>"+download_url+"</a></div>" if download_url else ""}
         </div>
         """
 
     html = f"""<!doctype html>
 <html lang="zh-CN"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>{TITLE} - UD</title>
+<title>{TITLE} - 上传</title>
 <style>
-body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;background:#0b1220;color:#e8eefc}}
-.wrap{{max-width:860px;margin:40px auto;padding:0 16px}}
-.card{{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);
-border-radius:14px;padding:18px;box-shadow:0 12px 30px rgba(0,0,0,.25)}}
-input[type=file],input[type=text]{{width:100%;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,.18);
-background:rgba(0,0,0,.25);color:#e8eefc}}
-button{{padding:10px 14px;border-radius:10px;border:0;cursor:pointer;font-weight:700;background:#4b8cff;color:#071022}}
-.muted{{color:#b7c3dd;font-size:13px}}
-a{{color:#a7c5ff;text-decoration:none}}
-pre{{background:rgba(0,0,0,.35);padding:12px;border-radius:10px;overflow:auto}}
+:root{{--bg:#0c1224;--card:rgba(14,19,33,.85);--stroke:rgba(255,255,255,.08);--muted:#b9c7e3;--accent:#6de9c5;--accent2:#7db2ff}}
+*{{box-sizing:border-box}}
+body{{margin:0;min-height:100vh;font-family:"Space Grotesk","IBM Plex Sans","PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:
+radial-gradient(circle at 10% 20%,rgba(93,173,255,.2),transparent 25%),
+radial-gradient(circle at 80% 0%,rgba(86,255,189,.18),transparent 25%),
+radial-gradient(circle at 50% 80%,rgba(133,99,255,.12),transparent 30%),
+linear-gradient(135deg,#0b1220 0%,#0f1a33 100%);color:#eaf0ff;}}
+.wrap{{max-width:940px;margin:0 auto;padding:40px 18px;}}
+.card{{background:var(--card);border:1px solid var(--stroke);border-radius:18px;padding:22px 20px;box-shadow:0 18px 50px rgba(0,0,0,.35);backdrop-filter:blur(8px);}}
+.title{{font-size:22px;font-weight:800;letter-spacing:0.2px;margin:0 0 6px;}}
+.muted{{color:var(--muted);font-size:13px;line-height:1.6;}}
+.row{{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:10px;}}
+.field-label{{margin:12px 0 6px;font-weight:700;font-size:13px;color:#dbe6ff;}}
+input[type=file],input[type=text]{{width:100%;padding:12px;border-radius:12px;border:1px solid var(--stroke);background:rgba(255,255,255,.04);color:#eaf0ff;outline:none;}}
+input[type=text]:focus,input[type=file]:focus{{border-color:var(--accent2);box-shadow:0 0 0 3px rgba(125,178,255,.18);}}
+button{{padding:12px 18px;border-radius:12px;border:0;cursor:pointer;font-weight:800;background:linear-gradient(135deg,var(--accent),#50c7ff);color:#061123;transition:transform .1s ease,box-shadow .2s ease;}}
+button:hover{{transform:translateY(-1px);box-shadow:0 10px 30px rgba(80,199,255,.3);}}
+.alert{{margin-top:16px;padding:14px;border-radius:14px;border:1px solid var(--stroke);background:rgba(0,0,0,.25);}}
+.alert.ok{{border-color:rgba(110,233,197,.55);box-shadow:0 0 0 1px rgba(110,233,197,.2);}}
+.alert.err{{border-color:rgba(255,123,123,.55);box-shadow:0 0 0 1px rgba(255,123,123,.15);}}
+.alert-title{{font-weight:800;margin-bottom:6px;}}
+.link-row{{margin-top:6px;word-break:break-all;font-size:13px;}}
+a{{color:var(--accent2);text-decoration:none;}}
+a:hover{{text-decoration:underline;}}
+.code{{background:rgba(0,0,0,.35);padding:14px;border-radius:12px;overflow:auto;border:1px solid var(--stroke);color:#d9e7ff;}}
+.section{{margin-top:18px;}}
+.section-title{{font-weight:700;font-size:14px;color:#dbe6ff;margin-bottom:6px;}}
+@media (max-width:640px){{.wrap{{padding:26px 14px;}}button{{width:100%;text-align:center;}}}}
 </style></head><body>
 <div class="wrap"><div class="card">
-<h1 style="margin:0 0 10px;font-size:20px;">UD Upload（{key_note}）</h1>
-<div class="muted">仅开放 /hc /hp /ud。上传成功返回一次性下载链接：下载成功后立即失效（再次访问为 404）。</div>
+<div class="title">{TITLE} 上传 {("（需要 key）" if REQUIRE_UPLOAD_AUTH else "（无需 key）")}</div>
+<div class="muted">仅开放 /hc /hp /ud /ud/f/...（其余为空 404）。本页提交文件后返回一次性下载链接，成功下载后立即失效。</div>
 
-<form action="{base}/ud" method="post" enctype="multipart/form-data" style="margin-top:14px;">
-  {"<div class='muted' style='margin:10px 0 6px;'>Key：</div><input type='text' name='key' placeholder='填入 key（错了会在本页提示）'/>" if REQUIRE_UPLOAD_AUTH else ""}
-  <div class="muted" style="margin:10px 0 6px;">选择文件：</div>
+<form action="{base}/ud" method="post" enctype="multipart/form-data" style="margin-top:16px;">
+  {"<div class='field-label'>Key</div><input type='text' name='key' placeholder='填入 key（错了会在本页提示）'/>" if REQUIRE_UPLOAD_AUTH else ""}
+  <div class="field-label">选择文件</div>
   <input type="file" name="file" required/>
-  <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
-    <button type="submit">上传</button>
+  <div class="row">
+    <button type="submit">立即上传</button>
     <div class="muted">最大 {MAX_UPLOAD_MB}MB；单 IP {RATE_LIMIT_SECONDS}s 1 次；待下载最多 {MAX_PENDING_FILES} 份；TTL {TOKEN_TTL_SECONDS}s。</div>
   </div>
 </form>
 
 {msg_block}
 
-<h2 style="margin-top:18px;font-size:16px;">curl 示例</h2>
-<pre>{curl_example}</pre>
-
-<div class="muted" style="margin-top:14px;">
-  帮助：<a href="{base}/hp">{base}/hp</a> · 健康检查：<a href="{base}/hc">{base}/hc</a>
+<div class="section">
+  <div class="section-title">curl 示例</div>
+  <pre class="code">{curl_example}</pre>
 </div>
+
+<div class="muted" style="margin-top:14px;">帮助：<a href="{base}/hp">{base}/hp</a></div>
+<div class="muted">健康检查：<a href="{base}/hc">{base}/hc</a></div>
 </div></div></body></html>"""
     return (html, 200, {"Content-Type": "text/html; charset=utf-8"})
 
@@ -363,52 +417,184 @@ pre{{background:rgba(0,0,0,.35);padding:12px;border-radius:10px;overflow:auto}}
 # 路由：/hc /hp /ud + /ud/d/<token>
 # ==============================================================================
 
+def build_help_text(base: str) -> str:
+    if REQUIRE_UPLOAD_AUTH:
+        curl = f'curl -sS -F "file=@/path/to/file" "{base}/ud?key=YOUR_KEY"'
+    else:
+        curl = f'curl -sS -F "file=@/path/to/file" "{base}/ud"'
+    return f"""UD Relay 说明（Python 版本）
+
+用途
+- 一次性文件传输：上传后生成下载链接，成功下载 1 次后即失效。
+- 仅暴露最少接口，其余路径均返回空 404。
+
+接口
+- GET  {base}/hc                健康检查；返回调用次数、待下载数量/体积、存储占用
+- GET  {base}/hp                帮助文档（本页）
+- GET  {base}/ud                浏览器上传页；命令行访问时返回本说明
+- POST {base}/ud                上传文件（multipart/form-data，字段名 file；可选字段 key）
+- GET  {base}/ud/f/<token>/<filename>   一次性下载，成功后该 token 失效并删除文件
+- GET  {base}/ud/d/<token>              向后兼容旧版下载路径
+
+上传示例
+  {curl}
+
+规则
+- 最大上传：{MAX_UPLOAD_MB}MB
+- 速率限制：同一 IP 每 {RATE_LIMIT_SECONDS}s 1 次（0 关闭）
+- 待下载上限：{MAX_PENDING_FILES} 份（0 关闭；超出会从最旧的 ready 起淘汰）
+- 链接 TTL：{TOKEN_TTL_SECONDS}s（0 关闭；超时会清理）
+- 上传鉴权：{"需要 key（UD_API_KEY 已配置）" if REQUIRE_UPLOAD_AUTH else "无需 key"}
+- 同名覆盖：不存在（按 token 存储）；超量或过期会清理
+- 下载一次性：token 在下载成功前会被抢占，成功后删除文件+元数据
+
+环境变量 / 配置
+- UD_API_KEY                  可选；设置后上传需提供 key
+- UD_UPLOAD_DIR               存储目录，默认 ./uploads
+- UD_BIND_HOST / UD_BIND_PORT 监听，默认 :: / 8000
+- UD_MAX_UPLOAD_MB            默认 50
+- UD_RATE_LIMIT_SECONDS       默认 10
+- UD_MAX_PENDING_FILES        默认 10
+- UD_TOKEN_TTL_SECONDS        默认 86400
+- UD_CLEANUP_INTERVAL_SECONDS 清理周期，默认 120
+- UD_ENABLE_PROXY_FIX         可信反代时设 1 以支持 X-Forwarded-*（默认 1）
+- UD_PROXY_FIX_X_PREFIX       支持 X-Forwarded-Prefix，默认 1
+- UD_CLAIMED_GRACE_SECONDS    已 claimed 残留的兜底删除时间，默认 1800
+- UD_TMP_GRACE_SECONDS        .tmp 残留兜底删除时间，默认 1800
+"""
+
+def render_help_page(base: str):
+    text = build_help_text(base)
+    if not wants_html():
+        return (text, 200, {"Content-Type": "text/plain; charset=utf-8"})
+    html = f"""<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>{TITLE} - 帮助</title>
+<style>
+:root{{--bg:#0c1224;--card:rgba(14,19,33,.85);--stroke:rgba(255,255,255,.08);--muted:#b9c7e3;--accent:#6de9c5;--accent2:#7db2ff}}
+*{{box-sizing:border-box}}
+body{{margin:0;min-height:100vh;font-family:"Space Grotesk","IBM Plex Sans","PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:
+radial-gradient(circle at 10% 20%,rgba(93,173,255,.2),transparent 25%),
+radial-gradient(circle at 80% 0%,rgba(86,255,189,.18),transparent 25%),
+radial-gradient(circle at 50% 80%,rgba(133,99,255,.12),transparent 30%),
+linear-gradient(135deg,#0b1220 0%,#0f1a33 100%);color:#eaf0ff;}}
+.wrap{{max-width:940px;margin:0 auto;padding:40px 18px;}}
+.card{{background:var(--card);border:1px solid var(--stroke);border-radius:18px;padding:22px 20px;box-shadow:0 18px 50px rgba(0,0,0,.35);backdrop-filter:blur(8px);}}
+.title{{font-size:22px;font-weight:800;margin:0 0 6px;}}
+.muted{{color:var(--muted);font-size:13px;line-height:1.6;}}
+a{{color:var(--accent2);text-decoration:none;}}
+a:hover{{text-decoration:underline;}}
+.code{{background:rgba(0,0,0,.35);padding:14px;border-radius:12px;overflow:auto;border:1px solid var(--stroke);color:#d9e7ff;white-space:pre-wrap;}}
+@media (max-width:640px){{.wrap{{padding:26px 14px;}}}}
+</style></head><body>
+<div class="wrap"><div class="card">
+<div class="title">{TITLE} 帮助</div>
+<div class="muted" style="margin-bottom:12px;">上传入口：<a href="{base}/ud">{base}/ud</a></div>
+<pre class="code">{text}</pre>
+</div></div></body></html>"""
+    return (html, 200, {"Content-Type": "text/html; charset=utf-8"})
+
+def render_hc_page(base: str, stats: dict):
+    def fmt_num(n):
+        return n if isinstance(n, (int, float)) else "-"
+    def fmt_bytes(n):
+        if not isinstance(n, (int, float)) or n < 0:
+            return "未知"
+        if n < 1024:
+            return f"{n} B"
+        units = ["KB", "MB", "GB", "TB"]
+        v = n / 1024
+        idx = 0
+        while v >= 1024 and idx < len(units) - 1:
+            v /= 1024
+            idx += 1
+        return f"{v:.2f} {units[idx]}"
+
+    if not wants_html():
+        return (json.dumps(stats, ensure_ascii=False, indent=2) + "\n", 200, {"Content-Type": "application/json; charset=utf-8"})
+
+    html = f"""<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>{TITLE} - 健康检查</title>
+<style>
+:root{{--bg:#0c1224;--card:rgba(14,19,33,.85);--stroke:rgba(255,255,255,.08);--muted:#b9c7e3;--accent:#6de9c5;--accent2:#7db2ff}}
+*{{box-sizing:border-box}}
+body{{margin:0;min-height:100vh;font-family:"Space Grotesk","IBM Plex Sans","PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:
+radial-gradient(circle at 10% 20%,rgba(93,173,255,.2),transparent 25%),
+radial-gradient(circle at 80% 0%,rgba(86,255,189,.18),transparent 25%),
+radial-gradient(circle at 50% 80%,rgba(133,99,255,.12),transparent 30%),
+linear-gradient(135deg,#0b1220 0%,#0f1a33 100%);color:#eaf0ff;}}
+.wrap{{max-width:940px;margin:0 auto;padding:40px 18px;}}
+.card{{background:var(--card);border:1px solid var(--stroke);border-radius:18px;padding:22px 20px;box-shadow:0 18px 50px rgba(0,0,0,.35);backdrop-filter:blur(8px);}}
+.title{{font-size:22px;font-weight:800;margin:0 0 6px;}}
+.muted{{color:var(--muted);font-size:13px;line-height:1.6;}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-top:14px;}}
+.tile{{border:1px solid var(--stroke);border-radius:14px;padding:14px 12px;background:rgba(0,0,0,.2);}}
+.tile h3{{margin:0 0 6px;font-size:15px;}}
+.value{{font-size:20px;font-weight:800;}}
+a{{color:var(--accent2);text-decoration:none;}}
+a:hover{{text-decoration:underline;}}
+.code{{background:rgba(0,0,0,.35);padding:14px;border-radius:12px;overflow:auto;border:1px solid var(--stroke);color:#d9e7ff;white-space:pre-wrap;}}
+@media (max-width:640px){{.wrap{{padding:26px 14px;}}}}
+</style></head><body>
+<div class="wrap"><div class="card">
+<div class="title">{TITLE} 健康检查</div>
+<div class="muted">上传入口：<a href="{base}/ud">{base}/ud</a></div>
+<div class="muted">帮助文档：<a href="{base}/hp">{base}/hp</a></div>
+<div class="grid">
+  <div class="tile"><h3>调用次数</h3><div class="value">{fmt_num(stats.get("hc_calls"))}</div><div class="muted">hc 自进程启动以来的累计调用</div></div>
+  <div class="tile"><h3>待下载文件</h3><div class="value">{fmt_num(stats.get("pending_tokens"))}</div><div class="muted">尚未被消费的一次性链接数量</div></div>
+  <div class="tile"><h3>待下载体积</h3><div class="value">{fmt_bytes(stats.get("pending_bytes"))}</div><div class="muted">当前 pending 文件大小汇总</div></div>
+  <div class="tile"><h3>存储文件数</h3><div class="value">{fmt_num(stats.get("objects"))}</div><div class="muted">存储目录内的实际数据文件数</div></div>
+  <div class="tile"><h3>存储占用</h3><div class="value">{fmt_bytes(stats.get("bytes"))}</div><div class="muted">存储目录内的数据文件大小总和</div></div>
+</div>
+<div class="section" style="margin-top:16px;">
+  <div class="muted">原始 JSON：</div>
+  <pre class="code">{json.dumps(stats, ensure_ascii=False, indent=2)}</pre>
+</div>
+</div></div></body></html>"""
+    return (html, 200, {"Content-Type": "text/html; charset=utf-8"})
+
 @app.route("/hc", methods=["GET"])
 def hc():
-    return ("ok\n", 200)
+    global _hc_count
+    _hc_count += 1
+    base = request.url_root.rstrip("/")
+
+    pending = pending_stats()
+    # 统计数据文件（排除 meta/claimed/tmp）
+    objects = 0
+    total_bytes = 0
+    for p in UPLOAD_DIR.iterdir():
+        if not p.is_file():
+            continue
+        name = p.name
+        if name.endswith(".json") or name.endswith(".tmp"):
+            continue
+        try:
+            stat = p.stat()
+        except Exception:
+            continue
+        objects += 1
+        total_bytes += stat.st_size
+
+    body = {
+        "ok": True,
+        "ts": int(time.time()),
+        "hc_calls": _hc_count,
+        "pending_tokens": pending["pending_tokens"],
+        "pending_bytes": pending["pending_bytes"],
+        "objects": objects,
+        "bytes": total_bytes,
+    }
+    return render_hc_page(base, body)
 
 @app.route("/hp", methods=["GET"])
 def hp():
     base = request.url_root.rstrip("/")
-    curl_key = "YOUR_KEY" if REQUIRE_UPLOAD_AUTH else ""
-    curl_upload = f'curl -sS -F "file=@/path/to/file" "{base}/ud?key={curl_key}"'.rstrip("?key=")
-
-    text = f"""UD Help
-
-GET  {base}/hc
-GET  {base}/hp
-GET  {base}/ud
-POST {base}/ud
-GET  {base}/ud/d/<token>   one-time download (then 404)
-
-curl upload:
-  {curl_upload}
-"""
-    if not wants_html():
-        return (text, 200, {"Content-Type": "text/plain; charset=utf-8"})
-
-    # 简洁 HTML（不赘述）
-    html = f"""<!doctype html><html lang="zh-CN"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>{TITLE} - Help</title></head><body style="font-family:system-ui;background:#0b1220;color:#e8eefc;padding:24px">
-<h2>UD Help</h2>
-<pre style="background:#111a2e;padding:12px;border-radius:10px;overflow:auto">{text}</pre>
-<h3>Env vars</h3>
-<pre style="background:#111a2e;padding:12px;border-radius:10px;overflow:auto">UD_API_KEY=...                   # optional; if set, POST /ud requires key
-UD_UPLOAD_DIR=./uploads
-UD_BIND_HOST=::
-UD_BIND_PORT=8000
-UD_MAX_UPLOAD_MB=50
-UD_RATE_LIMIT_SECONDS=10          # 0 disables
-UD_MAX_PENDING_FILES=10           # 0 disables
-UD_TOKEN_TTL_SECONDS=86400        # 0 disables
-UD_CLEANUP_INTERVAL_SECONDS=120
-UD_ENABLE_PROXY_FIX=1
-UD_PROXY_FIX_X_PREFIX=1
-UD_CLAIMED_GRACE_SECONDS=1800
-UD_TMP_GRACE_SECONDS=1800</pre>
-</body></html>"""
-    return (html, 200, {"Content-Type": "text/html; charset=utf-8"})
+    return render_help_page(base)
 
 @app.route("/ud", methods=["GET"])
 def ud_get():
@@ -416,6 +602,7 @@ def ud_get():
 
 @app.route("/ud", methods=["POST"])
 def ud_post():
+    base = request.url_root.rstrip("/")
     # 网页端：key 错/限速/文件错误 都在本页提示，不跳转
     if REQUIRE_UPLOAD_AUTH and not check_upload_auth():
         return render_ud_page("Key 错误或缺失，上传未执行。", level="err")
@@ -445,8 +632,15 @@ def ud_post():
     if UPLOAD_DIR not in file_path.parents or UPLOAD_DIR not in tmp.parents:
         return render_ud_page("内部路径错误。", level="err") if wants_html() else ("Invalid path\n", 400)
 
-    f.save(tmp)
-    os.replace(tmp, file_path)
+    try:
+        f.save(tmp)
+        os.replace(tmp, file_path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return render_ud_page("上传失败：写入文件异常。", level="err") if wants_html() else ("Upload failed\n", 500)
 
     exp = int(time.time()) + TOKEN_TTL_SECONDS if TOKEN_TTL_SECONDS else 0
     meta = {
@@ -462,14 +656,13 @@ def ud_post():
     # 清理（过期 + 超量 + 残留）
     cleanup_tokens()
 
-    dl = make_external("ud_download", token=token)
+    dl = f"{base}/ud/f/{token}/{quote(original_name)}"
     if wants_html():
         return render_ud_page("上传成功！", level="ok", download_url=dl)
 
     return (f"OK\n{dl}\n", 201, {"Content-Type": "text/plain; charset=utf-8"})
 
-@app.route("/ud/d/<token>", methods=["GET"])
-def ud_download(token: str):
+def _handle_download(token: str, provided_name: Optional[str] = None):
     # 一次性下载：成功一次后删除 meta + 文件；之后统一 404 空 body
     if not token or not TOKEN_RE.fullmatch(token):
         abort(404)
@@ -503,6 +696,11 @@ def ud_download(token: str):
     if not stored_name:
         cleanup_pair(meta, meta_file)
         abort(404)
+
+    # 校验下载名（若提供）
+    if provided_name:
+        if sanitize_filename(provided_name) != download_name:
+            abort(404)
 
     path = (UPLOAD_DIR / stored_name).resolve()
     if UPLOAD_DIR not in path.parents or not path.exists() or not path.is_file():
@@ -552,6 +750,15 @@ def ud_download(token: str):
     resp.call_on_close(_cleanup)
     return resp
 
+@app.route("/ud/d/<token>", methods=["GET"])
+def ud_download_legacy(token: str):
+    return _handle_download(token, None)
+
+@app.route("/ud/f/<token>/<path:filename>", methods=["GET"])
+def ud_download(token: str, filename: str):
+    # filename 仅用于匹配正确的下载名，防止错误 token 关联
+    return _handle_download(token, filename)
+
 # ==============================================================================
 # 启动 banner：补充环境变量说明
 # ==============================================================================
@@ -571,7 +778,8 @@ def print_startup_banner():
     print("  GET  /hp  (no auth)")
     print("  GET  /ud  (no auth)")
     print("  POST /ud  (upload; key optional depending config)")
-    print("  GET  /ud/d/<token> (one-time download; after success -> 404)\n")
+    print("  GET  /ud/f/<token>/<filename> (one-time download; after success -> 404)")
+    print("  GET  /ud/d/<token> (legacy download path)\n")
 
     print("Environment variables:")
     print("  UD_API_KEY=...                   # optional; if set, POST /ud requires key")
