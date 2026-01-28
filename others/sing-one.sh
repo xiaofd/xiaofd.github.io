@@ -1,0 +1,1744 @@
+#!/usr/bin/env bash
+# 适用系统: Debian 11~13 / Alpine（Alpine 需先安装 bash: apk add bash）
+# 适用架构: x86/x64/arm64/arm32
+# 功能概述: sing-box + Reality 一键部署/管理，支持多入口与多出口
+set -euo pipefail
+
+SB_BIN="/usr/local/bin/sing-box"
+CONFIG_DIR="/etc/sing-box"
+MANAGER_CONF="${CONFIG_DIR}/manager.conf"
+INBOUNDS_FILE="${CONFIG_DIR}/inbounds.list"
+OUTBOUNDS_DIR="${CONFIG_DIR}/outbounds.d"
+ENDPOINTS_DIR="${CONFIG_DIR}/endpoints.d"
+SERVICE_FILE="/etc/systemd/system/sing-box.service"
+LOGROTATE_FILE="/etc/logrotate.d/sing-box"
+PID_FILE="/run/sing-box.pid"
+OPENRC_SERVICE="/etc/init.d/sing-box"
+TMP_DIR="/tmp/singbox-onekey"
+SB_TGZ="${TMP_DIR}/sing-box.tar.gz"
+SB_UNPACK_DIR="${TMP_DIR}/sing-box_unpack"
+WGCF_BIN="${TMP_DIR}/wgcf"
+WGCF_DST="/usr/local/bin/wgcf"
+WGCF_DIR="${TMP_DIR}/wgcf_work"
+DEFAULT_SNI="www.microsoft.com"
+
+C_RESET=""
+C_BOLD=""
+C_DIM=""
+C_RED=""
+C_GREEN=""
+C_YELLOW=""
+C_BLUE=""
+C_CYAN=""
+OS_VERSION=""
+ARCH_LABEL=""
+OS_ID=""
+OS_NAME=""
+
+msg() { printf '%s\n' "$*"; }
+ui() { printf '%s\n' "$*" >&2; }
+err() { printf '%s\n' "${C_RED}错误: $*${C_RESET}" >&2; }
+die() { err "$*"; exit 1; }
+
+cmd_exists() { command -v "$1" >/dev/null 2>&1; }
+systemd_available() { cmd_exists systemctl && [ -d /run/systemd/system ]; }
+openrc_available() { cmd_exists rc-service && [ -d /etc/init.d ]; }
+
+ensure_bash() {
+  if [ -z "${BASH_VERSION:-}" ]; then
+    err "请使用 bash 运行脚本 (bash $0)。"
+    exit 1
+  fi
+}
+
+init_colors() {
+  if [ -t 1 ] || [ -t 2 ]; then
+    C_RESET=$'\033[0m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'
+    C_CYAN=$'\033[36m'
+  fi
+}
+
+menu_title() { msg "${C_BOLD}${C_CYAN}$1${C_RESET}"; }
+menu_sep() { msg "${C_DIM}----------------------------------------${C_RESET}"; }
+menu_item() { msg "  ${C_YELLOW}$1)${C_RESET} $2"; }
+
+check_os() {
+  if [ ! -r /etc/os-release ]; then
+    die "无法识别系统版本，仅支持 Debian 11~13/Alpine。"
+  fi
+  # shellcheck source=/etc/os-release
+  . /etc/os-release
+  OS_ID="${ID:-}"
+  if [ "$OS_ID" = "alpine" ]; then
+    OS_NAME="Alpine"
+    OS_VERSION="${VERSION_ID:-unknown}"
+    return 0
+  fi
+  if [ "$OS_ID" != "debian" ]; then
+    die "仅支持 Debian 11~13/Alpine。"
+  fi
+  local major
+  major="$(echo "${VERSION_ID:-}" | awk -F. '{print $1}')"
+  if ! echo "$major" | grep -qE '^[0-9]+$'; then
+    die "无法识别 Debian 版本，仅支持 Debian 11~13。"
+  fi
+  if [ "$major" -lt 11 ] || [ "$major" -gt 13 ]; then
+    die "仅支持 Debian 11~13 (当前: ${VERSION_ID:-unknown})。"
+  fi
+  OS_NAME="Debian"
+  OS_VERSION="${VERSION_ID:-11-13}"
+}
+
+is_alpine() {
+  [ "${OS_ID:-}" = "alpine" ]
+}
+
+get_arch_label() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "x64" ;;
+    i386|i486|i586|i686|x86) echo "x86" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7|armhf|arm) echo "arm32" ;;
+    *) echo "$(uname -m)" ;;
+  esac
+}
+
+ensure_tmp_dir() {
+  if [ ! -d /tmp ]; then
+    mkdir -p /tmp
+  fi
+  chmod 1777 /tmp 2>/dev/null || true
+  mkdir -p "$TMP_DIR"
+}
+
+tmp_path() {
+  local name="$1"
+  ensure_tmp_dir
+  echo "${TMP_DIR}/${name}.$$"
+}
+
+need_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    die "请用 root 运行。"
+  fi
+}
+
+ensure_dirs() {
+  mkdir -p "$CONFIG_DIR" "$OUTBOUNDS_DIR" "$ENDPOINTS_DIR" /var/log/sing-box
+}
+
+install_deps() {
+  msg "安装依赖中..."
+  ensure_tmp_dir
+  if is_alpine; then
+    cmd_exists apk || die "未找到 apk，无法安装依赖。"
+    apk add --no-cache curl ca-certificates logrotate
+    return 0
+  fi
+  apt-get update -y
+  apt-get install -y curl ca-certificates logrotate
+}
+
+detect_arch_singbox() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "linux-amd64" ;;
+    i386|i486|i586|i686|x86) echo "linux-386" ;;
+    aarch64|arm64) echo "linux-arm64" ;;
+    armv7l|armv7|armhf|arm) echo "linux-armv7" ;;
+    *) die "不支持的架构: $(uname -m)，仅支持 x86/x64/arm64/arm32。" ;;
+  esac
+}
+
+detect_arch_wgcf() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "amd64" ;;
+    i386|i486|i586|i686|x86) echo "386" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7|armhf|arm) echo "armv7" ;;
+    *) die "wgcf 不支持的架构: $(uname -m)，仅支持 x86/x64/arm64/arm32。" ;;
+  esac
+}
+
+get_singbox_version() {
+  local ver loc
+  ver="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null || true)"
+  ver="$(printf '%s' "$ver" | sed -n 's/.*"tag_name": *"v\\([^"]*\\)".*/\\1/p')"
+  if [ -z "$ver" ]; then
+    loc="$(curl -fsSLI https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null || true)"
+    loc="$(printf '%s' "$loc" | awk 'tolower($0) ~ /^location:/ {print $2; exit}' | tr -d '\r')"
+    ver="$(echo "$loc" | awk -F'/' '{print $NF}' | sed 's/^v//')"
+  fi
+  if [ -z "$ver" ]; then
+    ui "无法自动获取 sing-box 版本。"
+    read -r -p "请手动输入 sing-box 版本(如 1.10.0)，留空取消: " ver
+  fi
+  echo "$ver"
+}
+
+install_singbox() {
+  local ver arch file url
+  ver="$(get_singbox_version)"
+  [ -z "$ver" ] && die "已取消安装。"
+  arch="$(detect_arch_singbox)"
+  file="sing-box-${ver}-${arch}.tar.gz"
+  url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/${file}"
+
+  ensure_tmp_dir
+  rm -rf "$SB_UNPACK_DIR"
+  mkdir -p "$SB_UNPACK_DIR"
+
+  msg "下载 sing-box 中: ${SB_TGZ}"
+  curl -fsSL -o "$SB_TGZ" "$url"
+  tar -xzf "$SB_TGZ" -C "$SB_UNPACK_DIR"
+
+  local bin
+  bin="$(find "$SB_UNPACK_DIR" -type f -name sing-box | head -n 1)"
+  [ -z "$bin" ] && die "未找到 sing-box 二进制。"
+  install -m 755 "$bin" "$SB_BIN"
+}
+
+write_service() {
+  if ! systemd_available; then
+    return 0
+  fi
+  cat > "$SERVICE_FILE" <<'EOF'
+[Unit]
+Description=sing-box Service
+After=network.target nss-lookup.target
+
+[Service]
+User=root
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+Restart=on-failure
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+write_openrc_service() {
+  if ! openrc_available; then
+    return 0
+  fi
+  cat > "$OPENRC_SERVICE" <<'EOF'
+#!/sbin/openrc-run
+name="sing-box"
+description="sing-box Service"
+command="/usr/local/bin/sing-box"
+command_args="run -c /etc/sing-box/config.json"
+command_background="yes"
+pidfile="/run/sing-box.pid"
+output_log="/var/log/sing-box/sing-box.log"
+error_log="/var/log/sing-box/sing-box.log"
+
+depend() {
+  need net
+}
+EOF
+  chmod +x "$OPENRC_SERVICE"
+}
+
+setup_logrotate() {
+  mkdir -p "$(dirname "$LOGROTATE_FILE")"
+  cat > "$LOGROTATE_FILE" <<'EOF'
+/var/log/sing-box/*.log {
+  size 4M
+  rotate 3
+  compress
+  delaycompress
+  missingok
+  notifempty
+  copytruncate
+  su root root
+}
+EOF
+}
+
+start_singbox() {
+  ensure_dirs
+  if systemd_available; then
+    write_service
+    systemctl enable --now sing-box
+  elif openrc_available; then
+    write_openrc_service
+    rc-update add sing-box default >/dev/null 2>&1 || true
+    rc-service sing-box start
+  else
+    nohup "$SB_BIN" run -c "${CONFIG_DIR}/config.json" >/var/log/sing-box/sing-box.log 2>&1 &
+    echo $! > "$PID_FILE"
+  fi
+}
+
+stop_singbox() {
+  if systemd_available; then
+    systemctl stop sing-box || true
+  elif openrc_available; then
+    rc-service sing-box stop >/dev/null 2>&1 || true
+  else
+    if [ -f "$PID_FILE" ]; then
+      kill "$(cat "$PID_FILE")" >/dev/null 2>&1 || true
+      rm -f "$PID_FILE"
+    fi
+  fi
+}
+
+restart_singbox() {
+  if systemd_available; then
+    write_service
+    systemctl restart sing-box
+  elif openrc_available; then
+    write_openrc_service
+    rc-service sing-box restart
+  else
+    stop_singbox
+    start_singbox
+  fi
+}
+
+enable_accel() {
+  local virt cc qdisc
+  if ! cmd_exists systemd-detect-virt; then
+    return 0
+  fi
+  virt="$(systemd-detect-virt || true)"
+  case "$virt" in
+    kvm|qemu)
+      modprobe tcp_bbr >/dev/null 2>&1 || true
+      cat > /etc/sysctl.d/99-singbox-accel.conf <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+      sysctl --system >/dev/null 2>&1 || true
+      ;;
+    lxc|container)
+      if [ -r /proc/sys/net/ipv4/tcp_available_congestion_control ] && \
+         grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control; then
+        cc="bbr"
+      else
+        cc="cubic"
+      fi
+      qdisc="fq_codel"
+      cat > /etc/sysctl.d/99-singbox-accel.conf <<EOF
+net.core.default_qdisc=${qdisc}
+net.ipv4.tcp_congestion_control=${cc}
+EOF
+      sysctl --system >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
+gen_short_id() {
+  if cmd_exists od; then
+    od -An -N8 -tx1 /dev/urandom | tr -d ' \n'
+  elif cmd_exists hexdump; then
+    hexdump -n 8 -e '8/1 "%02x"' /dev/urandom
+  else
+    dd if=/dev/urandom bs=8 count=1 2>/dev/null | xxd -p | tr -d '\n'
+  fi
+}
+
+gen_uuid() {
+  cat /proc/sys/kernel/random/uuid
+}
+
+gen_reality_keys() {
+  local out
+  out="$("$SB_BIN" generate reality-keypair)"
+  PRIVATE_KEY="$(echo "$out" | awk -F': *' '/^Private([ ]?key|Key)/ {print $2; exit}')"
+  PUBLIC_KEY="$(echo "$out" | awk -F': *' '/^Public([ ]?key|Key)/ {print $2; exit}')"
+  if [ -z "${PRIVATE_KEY:-}" ] || [ -z "${PUBLIC_KEY:-}" ]; then
+    err "sing-box 输出:"
+    err "$out"
+    die "生成 Reality 密钥失败。"
+  fi
+}
+
+split_host_port() {
+  local in="$1" host port
+  IFS='|' read -r host port <<< "$(parse_hostport "$in")"
+  [ -z "$port" ] && port="443"
+  echo "${host}|${port}"
+}
+
+save_manager_conf() {
+  cat > "$MANAGER_CONF" <<EOF
+UUID=${UUID}
+PRIVATE_KEY=${PRIVATE_KEY}
+PUBLIC_KEY=${PUBLIC_KEY}
+SHORT_ID=${SHORT_ID}
+SERVER_NAME=${SERVER_NAME}
+DEST=${DEST}
+FINGERPRINT=${FINGERPRINT}
+SHARE_HOST=${SHARE_HOST}
+EOF
+}
+
+load_manager_conf() {
+  if [ ! -f "$MANAGER_CONF" ]; then
+    die "未初始化，请先安装。"
+  fi
+  # shellcheck source=/etc/sing-box/manager.conf
+  . "$MANAGER_CONF"
+}
+
+ensure_direct_outbounds() {
+  cat > "${OUTBOUNDS_DIR}/direct4.json" <<'EOF'
+{
+  "type": "direct",
+  "tag": "direct4",
+  "domain_strategy": "ipv4_only"
+}
+EOF
+  cat > "${OUTBOUNDS_DIR}/direct6.json" <<'EOF'
+{
+  "type": "direct",
+  "tag": "direct6",
+  "domain_strategy": "ipv6_only"
+}
+EOF
+}
+
+port_in_config() {
+  local port="$1"
+  if [ -f "$INBOUNDS_FILE" ] && awk -F'|' -v p="$port" '$2==p {found=1} END{exit !found}' "$INBOUNDS_FILE"; then
+    return 0
+  fi
+  return 1
+}
+
+port_is_listening() {
+  local port="$1"
+  if cmd_exists ss; then
+    ss -lnt | awk '{print $4}' | grep -qE "(:|\\])${port}$"
+  else
+    return 1
+  fi
+}
+
+prompt_port() {
+  local port ans
+  while true; do
+    read -r -p "监听端口 [1-65535]: " port
+    if ! echo "$port" | grep -qE '^[0-9]+$'; then
+      ui "端口无效。"
+      continue
+    fi
+    if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+      ui "端口范围错误。"
+      continue
+    fi
+    if port_in_config "$port"; then
+      ui "该端口已在当前配置中使用。"
+      continue
+    fi
+    if port_is_listening "$port"; then
+      read -r -p "端口疑似被占用，继续使用？[y/N]: " ans
+      case "$ans" in
+        y|Y) ;;
+        *) continue ;;
+      esac
+    fi
+    echo "$port"
+    return 0
+  done
+}
+
+urldecode() {
+  local data="${1//+/ }"
+  printf '%b' "${data//%/\\x}"
+}
+
+urlencode() {
+  local s="$1" out="" i c hex
+  LC_ALL=C
+  for ((i=0; i<${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *)
+        printf -v hex '%02X' "'$c"
+        out+="%${hex}"
+        ;;
+    esac
+  done
+  echo "$out"
+}
+
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+get_query_param() {
+  local key="$1" qs="$2"
+  echo "$qs" | tr '&' '\n' | awk -F= -v k="$key" '$1==k {print $2; exit}'
+}
+
+json_array_from_csv() {
+  local csv="$1"
+  echo "$csv" | tr ',' '\n' | awk 'BEGIN{printf "["} {gsub(/^[ \t]+|[ \t]+$/,""); if($0!=""){if(NR>1)printf ","; printf "\"%s\"", $0}} END{printf "]"}'
+}
+
+parse_hostport() {
+  local in="$1" host="" port=""
+  if echo "$in" | grep -q '^\['; then
+    host="${in#\[}"
+    host="${host%%]*}"
+    if echo "$in" | grep -q ']:[0-9]'; then
+      port="${in##*]:}"
+    fi
+  elif echo "$in" | grep -q '.*:.*:.*'; then
+    host="$in"
+    port=""
+  elif echo "$in" | grep -q ':'; then
+    host="${in%:*}"
+    port="${in##*:}"
+  else
+    host="$in"
+    port=""
+  fi
+  echo "${host}|${port}"
+}
+
+base64_decode() {
+  local in="$1" pad padstr
+  in="${in//-/+}"
+  in="${in//_/\/}"
+  pad=$(( (4 - ${#in} % 4) % 4 ))
+  if [ "$pad" -gt 0 ]; then
+    printf -v padstr '%*s' "$pad" ''
+    padstr="${padstr// /=}"
+    in="${in}${padstr}"
+  fi
+  printf '%s' "$in" | base64 -d 2>/dev/null
+}
+
+json_get() {
+  local key="$1" json="$2"
+  local val
+  val="$(echo "$json" | sed -n "s/.*\"${key}\"[ ]*:[ ]*\"\\([^\"]*\\)\".*/\\1/p")"
+  if [ -n "$val" ]; then
+    echo "$val"
+    return 0
+  fi
+  val="$(echo "$json" | sed -n "s/.*\"${key}\"[ ]*:[ ]*\\([0-9.]*\\).*/\\1/p")"
+  if [ -n "$val" ]; then
+    echo "$val"
+    return 0
+  fi
+  echo "$json" | sed -n "s/.*\"${key}\"[ ]*:[ ]*\\(true\\|false\\).*/\\1/p"
+}
+
+build_vless_outbound() {
+  local link="$1" tag="$2"
+  local base qs uuid hostport host port
+  local network security flow sni fp pbk sid spx path param_host service alpn insecure
+
+  link="${link#vless://}"
+  if echo "$link" | grep -q '#'; then
+    link="${link%%#*}"
+  fi
+  if echo "$link" | grep -q '\?'; then
+    qs="${link#*\?}"
+    base="${link%%\?*}"
+  else
+    qs=""
+    base="$link"
+  fi
+
+  uuid="${base%%@*}"
+  hostport="${base#*@}"
+  IFS='|' read -r host port <<< "$(parse_hostport "$hostport")"
+
+  if [ -z "$uuid" ] || [ -z "$host" ] || [ -z "$port" ]; then
+    die "VLESS 链接无效。"
+  fi
+
+  network="$(get_query_param type "$qs")"
+  [ -z "$network" ] && network="tcp"
+  security="$(get_query_param security "$qs")"
+  [ -z "$security" ] && security="none"
+  flow="$(get_query_param flow "$qs")"
+  sni="$(urldecode "$(get_query_param sni "$qs")")"
+  fp="$(get_query_param fp "$qs")"
+  pbk="$(get_query_param pbk "$qs")"
+  sid="$(get_query_param sid "$qs")"
+  spx="$(urldecode "$(get_query_param spx "$qs")")"
+  path="$(urldecode "$(get_query_param path "$qs")")"
+  param_host="$(urldecode "$(get_query_param host "$qs")")"
+  service="$(urldecode "$(get_query_param serviceName "$qs")")"
+  alpn="$(urldecode "$(get_query_param alpn "$qs")")"
+  insecure="$(get_query_param allowInsecure "$qs")"
+
+  case "$network" in
+    tcp|ws|grpc) ;;
+    *) die "不支持的 VLESS network 类型: $network" ;;
+  esac
+
+  local tls_block=""
+  if [ "$security" = "tls" ]; then
+    local tls_items=""
+    local tls_sni="${sni:-$host}"
+    tls_items="\"enabled\":true,\"server_name\":\"$(json_escape "$tls_sni")\""
+    if [ -n "$alpn" ]; then
+      tls_items="${tls_items},\"alpn\":$(json_array_from_csv "$alpn")"
+    fi
+    if [ "$insecure" = "1" ] || [ "$insecure" = "true" ]; then
+      tls_items="${tls_items},\"insecure\":true"
+    fi
+    tls_block="\"tls\":{${tls_items}}"
+  elif [ "$security" = "reality" ]; then
+    local r_sni="${sni:-$host}"
+    local r_fp="${fp:-chrome}"
+    [ -z "$pbk" ] && die "Reality 出口需要 pbk。"
+    [ -z "$sid" ] && die "Reality 出口需要 sid。"
+    [ -z "$spx" ] && spx="/"
+    tls_block="\"tls\":{\"enabled\":true,\"server_name\":\"$(json_escape "$r_sni")\",\"reality\":{\"enabled\":true,\"public_key\":\"$(json_escape "$pbk")\",\"short_id\":\"$(json_escape "$sid")\",\"fingerprint\":\"$(json_escape "$r_fp")\",\"spider_x\":\"$(json_escape "$spx")\"}}"
+  fi
+
+  local transport_block=""
+  if [ "$network" = "ws" ]; then
+    [ -z "$path" ] && path="/"
+    if [ -n "$param_host" ]; then
+      transport_block="\"transport\":{\"type\":\"ws\",\"path\":\"$(json_escape "$path")\",\"headers\":{\"Host\":\"$(json_escape "$param_host")\"}}"
+    else
+      transport_block="\"transport\":{\"type\":\"ws\",\"path\":\"$(json_escape "$path")\"}"
+    fi
+  elif [ "$network" = "grpc" ]; then
+    [ -z "$service" ] && die "gRPC 需要 serviceName。"
+    transport_block="\"transport\":{\"type\":\"grpc\",\"service_name\":\"$(json_escape "$service")\"}"
+  fi
+
+  local extra=""
+  if [ -n "$tls_block" ]; then
+    extra="${extra},${tls_block}"
+  fi
+  if [ -n "$transport_block" ]; then
+    extra="${extra},${transport_block}"
+  fi
+
+  cat > "${OUTBOUNDS_DIR}/${tag}.json" <<EOF
+{
+  "type": "vless",
+  "tag": "$(json_escape "$tag")",
+  "server": "$(json_escape "$host")",
+  "server_port": ${port},
+  "uuid": "$(json_escape "$uuid")"$( [ -n "$flow" ] && printf ',\n  "flow": "%s"' "$(json_escape "$flow")" )${extra}
+}
+EOF
+}
+
+build_vmess_outbound() {
+  local link="$1" tag="$2"
+  local payload json
+  local host port uuid aid net tls host_header path scy sni
+
+  payload="${link#vmess://}"
+  json="$(base64_decode "$payload")"
+  [ -z "$json" ] && die "VMess 链接解析失败。"
+
+  host="$(json_get add "$json")"
+  port="$(json_get port "$json")"
+  uuid="$(json_get id "$json")"
+  aid="$(json_get aid "$json")"
+  net="$(json_get net "$json")"
+  tls="$(json_get tls "$json")"
+  host_header="$(json_get host "$json")"
+  path="$(json_get path "$json")"
+  scy="$(json_get scy "$json")"
+  sni="$(json_get sni "$json")"
+
+  if [ "$tls" = "true" ]; then
+    tls="tls"
+  elif [ "$tls" = "false" ]; then
+    tls=""
+  fi
+
+  [ -z "$host" ] && die "VMess 链接缺少地址。"
+  [ -z "$port" ] && die "VMess 链接缺少端口。"
+  [ -z "$uuid" ] && die "VMess 链接缺少 UUID。"
+  [ -z "$net" ] && net="tcp"
+  [ -z "$scy" ] && scy="auto"
+
+  local tls_block=""
+  if [ "$tls" = "tls" ]; then
+    local tls_sni="${sni:-$host}"
+    tls_block="\"tls\":{\"enabled\":true,\"server_name\":\"$(json_escape "$tls_sni")\"}"
+  fi
+
+  local transport_block=""
+  if [ "$net" = "ws" ]; then
+    [ -z "$path" ] && path="/"
+    if [ -n "$host_header" ]; then
+      transport_block="\"transport\":{\"type\":\"ws\",\"path\":\"$(json_escape "$path")\",\"headers\":{\"Host\":\"$(json_escape "$host_header")\"}}"
+    else
+      transport_block="\"transport\":{\"type\":\"ws\",\"path\":\"$(json_escape "$path")\"}"
+    fi
+  elif [ "$net" = "grpc" ]; then
+    [ -z "$path" ] && die "VMess gRPC 缺少 serviceName。"
+    transport_block="\"transport\":{\"type\":\"grpc\",\"service_name\":\"$(json_escape "$path")\"}"
+  fi
+
+  local extra=""
+  if [ -n "$tls_block" ]; then
+    extra="${extra},${tls_block}"
+  fi
+  if [ -n "$transport_block" ]; then
+    extra="${extra},${transport_block}"
+  fi
+
+  local alter=""
+  if [ -n "$aid" ] && [ "$aid" != "0" ]; then
+    alter=",\n  \"alter_id\": ${aid}"
+  fi
+
+  cat > "${OUTBOUNDS_DIR}/${tag}.json" <<EOF
+{
+  "type": "vmess",
+  "tag": "$(json_escape "$tag")",
+  "server": "$(json_escape "$host")",
+  "server_port": ${port},
+  "uuid": "$(json_escape "$uuid")",
+  "security": "$(json_escape "$scy")"${alter}${extra}
+}
+EOF
+}
+
+build_trojan_outbound() {
+  local link="$1" tag="$2"
+  local base qs pass hostport host port
+  local network sni alpn insecure path param_host service
+
+  link="${link#trojan://}"
+  if echo "$link" | grep -q '#'; then
+    link="${link%%#*}"
+  fi
+  if echo "$link" | grep -q '\?'; then
+    qs="${link#*\?}"
+    base="${link%%\?*}"
+  else
+    qs=""
+    base="$link"
+  fi
+
+  pass="${base%%@*}"
+  hostport="${base#*@}"
+  IFS='|' read -r host port <<< "$(parse_hostport "$hostport")"
+
+  pass="$(urldecode "$pass")"
+  [ -z "$pass" ] && die "Trojan 缺少密码。"
+  [ -z "$host" ] && die "Trojan 缺少地址。"
+  [ -z "$port" ] && die "Trojan 缺少端口。"
+
+  network="$(get_query_param type "$qs")"
+  [ -z "$network" ] && network="tcp"
+  sni="$(urldecode "$(get_query_param sni "$qs")")"
+  alpn="$(urldecode "$(get_query_param alpn "$qs")")"
+  insecure="$(get_query_param allowInsecure "$qs")"
+  path="$(urldecode "$(get_query_param path "$qs")")"
+  param_host="$(urldecode "$(get_query_param host "$qs")")"
+  service="$(urldecode "$(get_query_param serviceName "$qs")")"
+
+  local tls_items="\"enabled\":true,\"server_name\":\"$(json_escape "${sni:-$host}")\""
+  if [ -n "$alpn" ]; then
+    tls_items="${tls_items},\"alpn\":$(json_array_from_csv "$alpn")"
+  fi
+  if [ "$insecure" = "1" ] || [ "$insecure" = "true" ]; then
+    tls_items="${tls_items},\"insecure\":true"
+  fi
+  local tls_block="\"tls\":{${tls_items}}"
+
+  local transport_block=""
+  if [ "$network" = "ws" ]; then
+    [ -z "$path" ] && path="/"
+    if [ -n "$param_host" ]; then
+      transport_block="\"transport\":{\"type\":\"ws\",\"path\":\"$(json_escape "$path")\",\"headers\":{\"Host\":\"$(json_escape "$param_host")\"}}"
+    else
+      transport_block="\"transport\":{\"type\":\"ws\",\"path\":\"$(json_escape "$path")\"}"
+    fi
+  elif [ "$network" = "grpc" ]; then
+    [ -z "$service" ] && die "Trojan gRPC 需要 serviceName。"
+    transport_block="\"transport\":{\"type\":\"grpc\",\"service_name\":\"$(json_escape "$service")\"}"
+  fi
+
+  local extra=""
+  [ -n "$tls_block" ] && extra="${extra},${tls_block}"
+  [ -n "$transport_block" ] && extra="${extra},${transport_block}"
+
+  cat > "${OUTBOUNDS_DIR}/${tag}.json" <<EOF
+{
+  "type": "trojan",
+  "tag": "$(json_escape "$tag")",
+  "server": "$(json_escape "$host")",
+  "server_port": ${port},
+  "password": "$(json_escape "$pass")"${extra}
+}
+EOF
+}
+
+build_ss_outbound() {
+  local link="$1" tag="$2"
+  local base qs userinfo hostport host port method password decoded
+
+  link="${link#ss://}"
+  if echo "$link" | grep -q '#'; then
+    link="${link%%#*}"
+  fi
+  if echo "$link" | grep -q '\?'; then
+    qs="${link#*\?}"
+    base="${link%%\?*}"
+  else
+    qs=""
+    base="$link"
+  fi
+
+  if echo "$base" | grep -q '@'; then
+    userinfo="${base%%@*}"
+    hostport="${base#*@}"
+  else
+    userinfo="$base"
+    hostport=""
+  fi
+
+  if echo "$userinfo" | grep -q ':'; then
+    method="${userinfo%%:*}"
+    password="${userinfo#*:}"
+  else
+    decoded="$(base64_decode "$userinfo")"
+    method="${decoded%%:*}"
+    password="${decoded#*:}"
+  fi
+
+  if [ -z "$hostport" ]; then
+    hostport="$qs"
+  fi
+  IFS='|' read -r host port <<< "$(parse_hostport "$hostport")"
+
+  [ -z "$host" ] && die "SS 缺少地址。"
+  [ -z "$port" ] && die "SS 缺少端口。"
+  [ -z "$method" ] && die "SS 缺少加密方式。"
+  password="$(urldecode "$password")"
+  [ -z "$password" ] && die "SS 缺少密码。"
+
+  cat > "${OUTBOUNDS_DIR}/${tag}.json" <<EOF
+{
+  "type": "shadowsocks",
+  "tag": "$(json_escape "$tag")",
+  "server": "$(json_escape "$host")",
+  "server_port": ${port},
+  "method": "$(json_escape "$method")",
+  "password": "$(json_escape "$password")"
+}
+EOF
+}
+
+build_hy2_outbound() {
+  local link="$1" tag="$2"
+  local base qs userinfo hostport host port password
+  local sni insecure alpn obfs obfs_pwd up down auth
+
+  link="${link#hysteria2://}"
+  link="${link#hy2://}"
+  if echo "$link" | grep -q '#'; then
+    link="${link%%#*}"
+  fi
+  if echo "$link" | grep -q '\?'; then
+    qs="${link#*\?}"
+    base="${link%%\?*}"
+  else
+    qs=""
+    base="$link"
+  fi
+
+  userinfo="${base%%@*}"
+  hostport="${base#*@}"
+  IFS='|' read -r host port <<< "$(parse_hostport "$hostport")"
+
+  if echo "$userinfo" | grep -q ':'; then
+    password="${userinfo#*:}"
+  else
+    password="$userinfo"
+  fi
+
+  auth="$(urldecode "$(get_query_param auth "$qs")")"
+  [ -n "$auth" ] && password="$auth"
+  sni="$(urldecode "$(get_query_param sni "$qs")")"
+  alpn="$(urldecode "$(get_query_param alpn "$qs")")"
+  insecure="$(get_query_param insecure "$qs")"
+  obfs="$(urldecode "$(get_query_param obfs "$qs")")"
+  obfs_pwd="$(urldecode "$(get_query_param obfs-password "$qs")")"
+  up="$(get_query_param upmbps "$qs")"
+  [ -z "$up" ] && up="$(get_query_param up_mbps "$qs")"
+  down="$(get_query_param downmbps "$qs")"
+  [ -z "$down" ] && down="$(get_query_param down_mbps "$qs")"
+
+  [ -z "$host" ] && die "HY2 缺少地址。"
+  [ -z "$port" ] && die "HY2 缺少端口。"
+  password="$(urldecode "$password")"
+  [ -z "$password" ] && die "HY2 缺少密码。"
+
+  local tls_items="\"enabled\":true,\"server_name\":\"$(json_escape "${sni:-$host}")\""
+  if [ -n "$alpn" ]; then
+    tls_items="${tls_items},\"alpn\":$(json_array_from_csv "$alpn")"
+  fi
+  if [ "$insecure" = "1" ] || [ "$insecure" = "true" ]; then
+    tls_items="${tls_items},\"insecure\":true"
+  fi
+  local tls_block="\"tls\":{${tls_items}}"
+
+  local obfs_block=""
+  if [ -n "$obfs" ] || [ -n "$obfs_pwd" ]; then
+    local obfs_type="${obfs:-salamander}"
+    obfs_block="\"obfs\":{\"type\":\"$(json_escape "$obfs_type")\""
+    if [ -n "$obfs_pwd" ]; then
+      obfs_block="${obfs_block},\"password\":\"$(json_escape "$obfs_pwd")\""
+    fi
+    obfs_block="${obfs_block}}"
+  fi
+
+  local extra=""
+  [ -n "$tls_block" ] && extra="${extra},${tls_block}"
+  [ -n "$obfs_block" ] && extra="${extra},${obfs_block}"
+  if [ -n "$up" ]; then
+    extra="${extra},\"up_mbps\":${up}"
+  fi
+  if [ -n "$down" ]; then
+    extra="${extra},\"down_mbps\":${down}"
+  fi
+
+  cat > "${OUTBOUNDS_DIR}/${tag}.json" <<EOF
+{
+  "type": "hysteria2",
+  "tag": "$(json_escape "$tag")",
+  "server": "$(json_escape "$host")",
+  "server_port": ${port},
+  "password": "$(json_escape "$password")"${extra}
+}
+EOF
+}
+
+build_outbound_from_link() {
+  local link="$1" tag="$2"
+  case "$link" in
+    vless://*) build_vless_outbound "$link" "$tag" ;;
+    vmess://*) build_vmess_outbound "$link" "$tag" ;;
+    trojan://*) build_trojan_outbound "$link" "$tag" ;;
+    ss://*) build_ss_outbound "$link" "$tag" ;;
+    hysteria2://*|hy2://*) build_hy2_outbound "$link" "$tag" ;;
+    *) die "不支持的链接协议。" ;;
+  esac
+}
+
+get_wgcf_version() {
+  local ver loc
+  ver="$(curl -fsSL https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null | sed -n 's/.*"tag_name": *"v\\([^"]*\\)".*/\\1/p')"
+  if [ -z "$ver" ]; then
+    loc="$(curl -fsSLI https://github.com/ViRb3/wgcf/releases/latest 2>/dev/null | awk 'tolower($0) ~ /^location:/ {print $2; exit}' | tr -d '\r')"
+    ver="$(echo "$loc" | awk -F'/' '{print $NF}' | sed 's/^v//')"
+  fi
+  if [ -z "$ver" ]; then
+    ui "无法自动获取 wgcf 版本。"
+    read -r -p "请手动输入 wgcf 版本(如 2.2.23)，留空取消: " ver
+  fi
+  echo "$ver"
+}
+
+setup_warp() {
+  local ver arch url priv addr peer_pub endpoint mtu reserved addr4 addr6 res_json allowed allowed_json peer_reserved
+  if [ -f "${ENDPOINTS_DIR}/warp.json" ]; then
+    return 0
+  fi
+  rm -f "${OUTBOUNDS_DIR}/warp.json" >/dev/null 2>&1 || true
+  ensure_dirs
+  ensure_tmp_dir
+  rm -rf "$WGCF_DIR"
+  mkdir -p "$WGCF_DIR"
+  ver="$(get_wgcf_version)"
+  [ -z "$ver" ] && die "已取消 WARP 配置。"
+  arch="$(detect_arch_wgcf)"
+  url="https://github.com/ViRb3/wgcf/releases/latest/download/wgcf_${ver}_linux_${arch}"
+  ui "下载 wgcf 中: ${WGCF_BIN}"
+  curl -fsSL -o "$WGCF_BIN" "$url"
+  install -m 755 "$WGCF_BIN" "$WGCF_DST"
+  rm -f "$WGCF_BIN"
+
+  (cd "$WGCF_DIR" && "$WGCF_DST" register --accept-tos >/dev/null 2>&1 && "$WGCF_DST" generate >/dev/null 2>&1) || die "wgcf 执行失败。"
+  rm -f "$WGCF_DST" >/dev/null 2>&1 || true
+
+  priv="$(awk -F' = ' '/^PrivateKey/ {print $2; exit}' "${WGCF_DIR}/wgcf-profile.conf")"
+  addr="$(awk -F' = ' '/^Address/ {print $2; exit}' "${WGCF_DIR}/wgcf-profile.conf" | tr -d ' ')"
+  peer_pub="$(awk -F' = ' '/^PublicKey/ {print $2; exit}' "${WGCF_DIR}/wgcf-profile.conf")"
+  endpoint="$(awk -F' = ' '/^Endpoint/ {print $2; exit}' "${WGCF_DIR}/wgcf-profile.conf")"
+  mtu="$(awk -F' = ' '/^MTU/ {print $2; exit}' "${WGCF_DIR}/wgcf-profile.conf")"
+  reserved="$(awk -F' = ' '/^Reserved/ {print $2; exit}' "${WGCF_DIR}/wgcf-profile.conf")"
+  allowed="$(awk -F' = ' '/^AllowedIPs/ {print $2; exit}' "${WGCF_DIR}/wgcf-profile.conf")"
+
+  IFS=',' read -r addr4 addr6 <<< "$addr"
+  [ -z "$mtu" ] && mtu="1280"
+
+  if [ -n "$reserved" ]; then
+    reserved="$(echo "$reserved" | tr -d ' ')"
+    res_json="$(echo "$reserved" | awk -F',' '{printf "[%s,%s,%s]",$1,$2,$3}')"
+    peer_reserved=",\n      \"reserved\": ${res_json}"
+  else
+    peer_reserved=""
+  fi
+
+  allowed="$(echo "$allowed" | tr -d ' ')"
+  if [ -z "$allowed" ]; then
+    if [ -n "$addr6" ]; then
+      allowed="0.0.0.0/0,::/0"
+    else
+      allowed="0.0.0.0/0"
+    fi
+  fi
+  allowed_json="$(json_array_from_csv "$allowed")"
+
+  local endpoint_host endpoint_port
+  IFS='|' read -r endpoint_host endpoint_port <<< "$(parse_hostport "$endpoint")"
+  if [ -z "$endpoint_port" ]; then
+    endpoint_port="2408"
+  fi
+  if ! echo "$endpoint_port" | grep -qE '^[0-9]+$'; then
+    endpoint_port="2408"
+  fi
+
+  cat > "${ENDPOINTS_DIR}/warp.json" <<EOF
+{
+  "type": "wireguard",
+  "tag": "warp",
+  "private_key": "$(json_escape "$priv")",
+  "address": ["$(json_escape "$addr4")"$( [ -n "$addr6" ] && printf ', "%s"' "$(json_escape "$addr6")" )],
+  "mtu": ${mtu},
+  "peers": [
+    {
+      "public_key": "$(json_escape "$peer_pub")",
+      "allowed_ips": ${allowed_json},
+      "address": "$(json_escape "$endpoint_host")",
+      "port": ${endpoint_port}${peer_reserved}
+    }
+  ]
+}
+EOF
+
+  mkdir -p "${CONFIG_DIR}/warp"
+  cp "${WGCF_DIR}/wgcf-account.toml" "${CONFIG_DIR}/warp/" || true
+  cp "${WGCF_DIR}/wgcf-profile.conf" "${CONFIG_DIR}/warp/" || true
+}
+
+list_custom_outbounds() {
+  local f base
+  for f in "${OUTBOUNDS_DIR}"/*.json; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f" .json)"
+    case "$base" in
+      direct4|direct6|warp) continue ;;
+    esac
+    echo "$base"
+  done
+}
+
+save_outbound_link() {
+  local tag="$1" link="$2"
+  echo "$link" > "${OUTBOUNDS_DIR}/${tag}.link"
+}
+
+read_outbound_link() {
+  local tag="$1"
+  if [ -f "${OUTBOUNDS_DIR}/${tag}.link" ]; then
+    cat "${OUTBOUNDS_DIR}/${tag}.link"
+  else
+    echo ""
+  fi
+}
+
+has_custom_outbounds() {
+  local f base
+  for f in "${OUTBOUNDS_DIR}"/*.json; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f" .json)"
+    case "$base" in
+      direct4|direct6|warp) continue ;;
+      *) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+has_endpoints() {
+  local f
+  for f in "${ENDPOINTS_DIR}"/*.json; do
+    [ -e "$f" ] && return 0
+  done
+  return 1
+}
+
+outbound_in_use() {
+  local tag="$1"
+  if [ -f "$INBOUNDS_FILE" ] && awk -F'|' -v t="$tag" '$3==t {found=1} END{exit !found}' "$INBOUNDS_FILE"; then
+    return 0
+  fi
+  return 1
+}
+
+select_existing_custom_outbound() {
+  local tags=() i=0 choice
+  while IFS= read -r tag; do
+    tags+=("$tag")
+  done < <(list_custom_outbounds)
+
+  if [ "${#tags[@]}" -eq 0 ]; then
+    die "没有自定义出口。"
+  fi
+
+  ui "已有自定义出口："
+  for tag in "${tags[@]}"; do
+    i=$((i+1))
+    ui "  ${i}) ${tag}"
+  done
+  while true; do
+    read -r -p "请选择: " choice
+    if echo "$choice" | grep -qE '^[0-9]+$' && [ "$choice" -ge 1 ] && [ "$choice" -le "${#tags[@]}" ]; then
+      echo "${tags[$((choice-1))]}"
+      return 0
+    fi
+  done
+}
+
+add_custom_outbound() {
+  local tag link
+  while true; do
+    read -r -p "出口标签(字母/数字/_，留空自动): " tag
+    if [ -z "$tag" ]; then
+      tag="out_$(date +%s)"
+      break
+    fi
+    if ! echo "$tag" | grep -qE '^[A-Za-z0-9_]+$'; then
+      ui "标签无效。"
+      continue
+    fi
+    if [ -f "${OUTBOUNDS_DIR}/${tag}.json" ] || [ -f "${ENDPOINTS_DIR}/${tag}.json" ]; then
+      ui "标签已存在。"
+      continue
+    fi
+    break
+  done
+  read -r -p "请输入出口链接(VLESS/VMess/Trojan/SS/HY2): " link
+  build_outbound_from_link "$link" "$tag"
+  save_outbound_link "$tag" "$link"
+  echo "$tag"
+}
+
+add_custom_outbound_only() {
+  local tag
+  tag="$(add_custom_outbound)"
+  if [ -s "$INBOUNDS_FILE" ]; then
+    build_config
+    restart_singbox
+    msg "自定义出口已添加: ${tag}"
+  else
+    msg "自定义出口已添加: ${tag} (当前无入口，未重启)"
+  fi
+}
+
+update_custom_outbound() {
+  local tag link
+  if ! has_custom_outbounds; then
+    msg "暂无自定义出口。"
+    return 0
+  fi
+  tag="$(select_existing_custom_outbound)"
+  read -r -p "请输入新的出口链接: " link
+  build_outbound_from_link "$link" "$tag"
+  save_outbound_link "$tag" "$link"
+  if [ -s "$INBOUNDS_FILE" ]; then
+    build_config
+    restart_singbox
+  fi
+  msg "自定义出口已更新: ${tag}"
+}
+
+delete_custom_outbound() {
+  local tag
+  if ! has_custom_outbounds; then
+    msg "暂无自定义出口。"
+    return 0
+  fi
+  tag="$(select_existing_custom_outbound)"
+  if outbound_in_use "$tag"; then
+    msg "该出口仍被入口使用，请先修改入口出口。"
+    return 0
+  fi
+  rm -f "${OUTBOUNDS_DIR}/${tag}.json"
+  rm -f "${OUTBOUNDS_DIR}/${tag}.link"
+  if [ -s "$INBOUNDS_FILE" ]; then
+    build_config
+    restart_singbox
+  fi
+  msg "自定义出口已删除: ${tag}"
+}
+
+show_custom_outbounds() {
+  local tag link
+  if ! has_custom_outbounds; then
+    msg "暂无自定义出口。"
+    return 0
+  fi
+  msg "自定义出口列表："
+  while IFS= read -r tag; do
+    link="$(read_outbound_link "$tag")"
+    if [ -n "$link" ]; then
+      msg "  ${tag}: ${link}"
+    else
+      msg "  ${tag}: (未记录原始链接)"
+    fi
+  done < <(list_custom_outbounds)
+}
+
+manage_custom_outbounds() {
+  local choice
+  while true; do
+    ui "${C_BOLD}${C_BLUE}自定义出口管理：${C_RESET}"
+    ui "  ${C_YELLOW}1)${C_RESET} 新增出口"
+    ui "  ${C_YELLOW}2)${C_RESET} 更新已有出口"
+    ui "  ${C_YELLOW}3)${C_RESET} 删除自定义出口"
+    ui "  ${C_YELLOW}4)${C_RESET} 查看现有出口"
+    ui "  ${C_YELLOW}0)${C_RESET} 返回"
+    read -r -p "请选择: " choice
+    case "$choice" in
+      1) add_custom_outbound_only ;;
+      2) update_custom_outbound ;;
+      3) delete_custom_outbound ;;
+      4) show_custom_outbounds ;;
+      0) return 0 ;;
+    esac
+  done
+}
+
+choose_outbound() {
+  local choice tag has_custom
+  ensure_direct_outbounds
+  if has_custom_outbounds; then
+    has_custom=1
+  else
+    has_custom=0
+  fi
+  ui "${C_BOLD}${C_BLUE}出口模式：${C_RESET}"
+  ui "  ${C_YELLOW}1)${C_RESET} 本机 IPv4"
+  ui "  ${C_YELLOW}2)${C_RESET} 本机 IPv6"
+  ui "  ${C_YELLOW}3)${C_RESET} WARP"
+  ui "  ${C_YELLOW}4)${C_RESET} 新增出口链接"
+  ui "  ${C_YELLOW}5)${C_RESET} 使用已有自定义出口"
+  while true; do
+    read -r -p "请选择: " choice
+    case "$choice" in
+      1) echo "direct4"; return 0 ;;
+      2) echo "direct6"; return 0 ;;
+      3) setup_warp 1>&2; echo "warp"; return 0 ;;
+      4) tag="$(add_custom_outbound)"; echo "$tag"; return 0 ;;
+      5)
+        if [ "$has_custom" -eq 1 ]; then
+          tag="$(select_existing_custom_outbound)"
+          echo "$tag"
+          return 0
+        else
+          ui "暂无自定义出口，请先添加。"
+        fi
+        ;;
+    esac
+  done
+}
+
+next_inbound_tag() {
+  local n=0
+  if [ -f "$INBOUNDS_FILE" ]; then
+    n="$(awk 'END{print NR}' "$INBOUNDS_FILE")"
+  fi
+  echo "in_$((n+1))"
+}
+
+add_inbound() {
+  local port out_tag tag remark
+  port="$(prompt_port)"
+  out_tag="$(choose_outbound)"
+  if ! echo "$out_tag" | grep -qE '^[A-Za-z0-9_]+$'; then
+    die "出口选择异常，请重试。"
+  fi
+  read -r -p "别名(用于分享链接，留空默认 sing-${port}): " remark
+  if [ -z "$remark" ]; then
+    remark="sing-${port}"
+  fi
+  tag="$(next_inbound_tag)"
+  echo "${tag}|${port}|${out_tag}|${remark}" >> "$INBOUNDS_FILE"
+  build_config
+  restart_singbox
+  msg "入口已添加。"
+}
+
+sanitize_inbounds() {
+  local tmp
+  [ -f "$INBOUNDS_FILE" ] || return 0
+  tmp="$(tmp_path inbounds.list)"
+  > "$tmp"
+  while IFS='|' read -r tag port out remark; do
+    [ -z "$tag" ] && continue
+    if ! echo "$tag" | grep -qE '^[A-Za-z0-9_]+$'; then
+      continue
+    fi
+    if ! echo "$port" | grep -qE '^[0-9]+$'; then
+      continue
+    fi
+    if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+      continue
+    fi
+    if [ -z "$out" ] || ! echo "$out" | grep -qE '^[A-Za-z0-9_]+$'; then
+      continue
+    fi
+    echo "${tag}|${port}|${out}|${remark}" >> "$tmp"
+  done < "$INBOUNDS_FILE"
+  mv "$tmp" "$INBOUNDS_FILE"
+}
+
+list_inbounds() {
+  local i=0
+  sanitize_inbounds
+  if [ ! -f "$INBOUNDS_FILE" ] || [ ! -s "$INBOUNDS_FILE" ]; then
+    ui "暂无入口。"
+    return 1
+  fi
+  while IFS='|' read -r tag port out remark; do
+    [ -z "$tag" ] && continue
+    i=$((i+1))
+    ui "  ${i}) ${tag}  端口=${port}  出口=${out}"
+  done < "$INBOUNDS_FILE"
+  return 0
+}
+
+select_inbound_index() {
+  local idx
+  list_inbounds || return 1
+  while true; do
+    read -r -p "请选择入口: " idx
+    if echo "$idx" | grep -qE '^[0-9]+$'; then
+      echo "$idx"
+      return 0
+    fi
+  done
+}
+
+update_inbound_line() {
+  local idx="$1" new_port="$2" new_out="$3"
+  local tmp
+  tmp="$(tmp_path inbounds.list)"
+  local i=0
+  while IFS='|' read -r tag port out remark; do
+    [ -z "$tag" ] && continue
+    i=$((i+1))
+    if [ "$i" -eq "$idx" ]; then
+      echo "${tag}|${new_port:-$port}|${new_out:-$out}|${remark}" >> "$tmp"
+    else
+      echo "${tag}|${port}|${out}|${remark}" >> "$tmp"
+    fi
+  done < "$INBOUNDS_FILE"
+  mv "$tmp" "$INBOUNDS_FILE"
+}
+
+remove_inbound_line() {
+  local idx="$1"
+  local tmp
+  tmp="$(tmp_path inbounds.list)"
+  local i=0
+  while IFS='|' read -r tag port out remark; do
+    [ -z "$tag" ] && continue
+    i=$((i+1))
+    if [ "$i" -ne "$idx" ]; then
+      echo "${tag}|${port}|${out}|${remark}" >> "$tmp"
+    fi
+  done < "$INBOUNDS_FILE"
+  mv "$tmp" "$INBOUNDS_FILE"
+}
+
+change_port() {
+  local idx new_port
+  idx="$(select_inbound_index)" || return 0
+  new_port="$(prompt_port)"
+  update_inbound_line "$idx" "$new_port" ""
+  build_config
+  restart_singbox
+  msg "端口已更新。"
+}
+
+change_outbound() {
+  local idx new_out
+  idx="$(select_inbound_index)" || return 0
+  new_out="$(choose_outbound)"
+  update_inbound_line "$idx" "" "$new_out"
+  build_config
+  restart_singbox
+  msg "出口已更新。"
+}
+
+remove_inbound() {
+  local idx
+  idx="$(select_inbound_index)" || return 0
+  remove_inbound_line "$idx"
+  if [ ! -s "$INBOUNDS_FILE" ]; then
+    stop_singbox
+    msg "已无入口，sing-box 已停止。"
+    return 0
+  fi
+  build_config
+  restart_singbox
+  msg "入口已删除。"
+}
+
+build_config() {
+  load_manager_conf
+  ensure_direct_outbounds
+  sanitize_inbounds
+
+  if [ ! -s "$INBOUNDS_FILE" ]; then
+    die "未配置任何入口。"
+  fi
+
+  local tmp dest_host dest_port
+  tmp="$(tmp_path config.json)"
+  IFS='|' read -r dest_host dest_port <<< "$(split_host_port "$DEST")"
+
+  local inbound_count=0 outbound_count=0 endpoint_count=0 rule_count=0
+  {
+    echo '{'
+    echo '  "log": {'
+    echo '    "level": "warn",'
+    echo '    "output": "/var/log/sing-box/sing-box.log"'
+    echo '  },'
+    echo '  "inbounds": ['
+    while IFS='|' read -r tag port out remark; do
+      [ -z "$tag" ] && continue
+      inbound_count=$((inbound_count+1))
+      if [ "$inbound_count" -gt 1 ]; then
+        echo '    ,'
+      fi
+      cat <<EOF
+    {
+      "type": "vless",
+      "tag": "$(json_escape "$tag")",
+      "listen": "0.0.0.0",
+      "listen_port": ${port},
+      "sniff": true,
+      "sniff_override_destination": true,
+      "users": [
+        {
+          "uuid": "$(json_escape "$UUID")",
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "$(json_escape "$SERVER_NAME")",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "$(json_escape "$dest_host")",
+            "server_port": ${dest_port}
+          },
+          "private_key": "$(json_escape "$PRIVATE_KEY")",
+          "short_id": ["$(json_escape "$SHORT_ID")"]
+        }
+      }
+    }
+EOF
+    done < "$INBOUNDS_FILE"
+    echo '  ],'
+    echo '  "outbounds": ['
+    for f in "${OUTBOUNDS_DIR}"/*.json; do
+      [ -e "$f" ] || continue
+      outbound_count=$((outbound_count+1))
+      if [ "$outbound_count" -gt 1 ]; then
+        echo '    ,'
+      fi
+      sed 's/^/    /' "$f"
+    done
+    echo '  ],'
+    if has_endpoints; then
+      echo '  "endpoints": ['
+      for f in "${ENDPOINTS_DIR}"/*.json; do
+        [ -e "$f" ] || continue
+        endpoint_count=$((endpoint_count+1))
+        if [ "$endpoint_count" -gt 1 ]; then
+          echo '    ,'
+        fi
+        sed 's/^/    /' "$f"
+      done
+      echo '  ],'
+    fi
+    echo '  "route": {'
+    echo '    "auto_detect_interface": true,'
+    echo '    "rules": ['
+    while IFS='|' read -r tag port out remark; do
+      [ -z "$tag" ] && continue
+      if [ ! -f "${OUTBOUNDS_DIR}/${out}.json" ] && [ ! -f "${ENDPOINTS_DIR}/${out}.json" ]; then
+        die "未找到出口: ${out}"
+      fi
+      rule_count=$((rule_count+1))
+      if [ "$rule_count" -gt 1 ]; then
+        echo '      ,'
+      fi
+      cat <<EOF
+      {
+        "inbound": ["$(json_escape "$tag")"],
+        "outbound": "$(json_escape "$out")"
+      }
+EOF
+    done < "$INBOUNDS_FILE"
+    echo '    ]'
+    echo '  }'
+    echo '}'
+  } > "$tmp"
+
+  mv "$tmp" "${CONFIG_DIR}/config.json"
+}
+
+get_public_ip4() {
+  curl -4 -fsSL --max-time 6 https://api.ipify.org 2>/dev/null || true
+}
+
+get_public_ip6() {
+  curl -6 -fsSL --max-time 6 https://api64.ipify.org 2>/dev/null || true
+}
+
+show_info() {
+  load_manager_conf
+  local host4 host6 host link_host
+  link_host=""
+  if [ -n "${SHARE_HOST:-}" ]; then
+    link_host="$SHARE_HOST"
+  else
+    host4="$(get_public_ip4)"
+    host6="$(get_public_ip6)"
+  fi
+
+  msg "Reality 参数："
+  msg "  UUID: ${UUID}"
+  msg "  公钥: ${PUBLIC_KEY}"
+  msg "  ShortID: ${SHORT_ID}"
+  msg "  SNI: ${SERVER_NAME}"
+  msg "  目标: ${DEST}"
+
+  if [ -n "$link_host" ]; then
+    host="$link_host"
+  fi
+
+  msg "入口列表："
+  while IFS='|' read -r tag port out remark; do
+    [ -z "$tag" ] && continue
+    local alias frag
+    alias="${remark:-$tag}"
+    frag="$(urlencode "$alias")"
+    msg "  ${tag}  端口=${port}  出口=${out}"
+    if [ -n "$link_host" ]; then
+      msg "  vless://${UUID}@${host}:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
+    else
+      if [ -n "$host4" ]; then
+        msg "  vless://${UUID}@${host4}:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
+      fi
+      if [ -n "$host6" ]; then
+        msg "  vless://${UUID}@[${host6}]:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
+      fi
+      if [ -z "$host4" ] && [ -z "$host6" ]; then
+        msg "  vless://${UUID}@SERVER_IP:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
+      fi
+    fi
+  done < "$INBOUNDS_FILE"
+}
+
+update_base_config() {
+  load_manager_conf
+  local ans
+  read -r -p "Reality SNI(建议常见 TLS 域名，默认: ${DEFAULT_SNI}): " SERVER_NAME_NEW
+  SERVER_NAME="${SERVER_NAME_NEW:-$SERVER_NAME}"
+  read -r -p "Reality 目标 [${DEST}]: " DEST_NEW
+  DEST="${DEST_NEW:-$DEST}"
+  read -r -p "分享地址 [${SHARE_HOST}]: " SHARE_HOST_NEW
+  SHARE_HOST="${SHARE_HOST_NEW:-$SHARE_HOST}"
+  read -r -p "重新生成 UUID？[y/N]: " ans
+  case "$ans" in
+    y|Y) UUID="$(gen_uuid)" ;;
+  esac
+  read -r -p "重新生成 Reality 密钥？[y/N]: " ans
+  case "$ans" in
+    y|Y)
+      gen_reality_keys
+      SHORT_ID="$(gen_short_id)"
+      ;;
+  esac
+  save_manager_conf
+  build_config
+  restart_singbox
+  msg "基础配置已更新。"
+}
+
+install_flow() {
+  need_root
+  install_deps
+  install_singbox
+  ensure_dirs
+  enable_accel
+  write_service
+  write_openrc_service
+  setup_logrotate
+
+  UUID="$(gen_uuid)"
+  SHORT_ID="$(gen_short_id)"
+  FINGERPRINT="chrome"
+  gen_reality_keys
+
+  read -r -p "Reality SNI(建议常见 TLS 域名，默认: ${DEFAULT_SNI}): " SERVER_NAME
+  SERVER_NAME="${SERVER_NAME:-${DEFAULT_SNI}}"
+  read -r -p "Reality 目标(默认: ${SERVER_NAME}:443): " DEST
+  DEST="${DEST:-${SERVER_NAME}:443}"
+  read -r -p "分享地址(域名或IP，留空自动获取): " SHARE_HOST
+
+  save_manager_conf
+  > "$INBOUNDS_FILE"
+
+  msg "添加首个入口："
+  add_inbound
+
+  build_config
+  start_singbox
+  show_info
+}
+
+uninstall_all() {
+  need_root
+  stop_singbox
+  if systemd_available; then
+    systemctl disable sing-box >/dev/null 2>&1 || true
+    rm -f "$SERVICE_FILE"
+    systemctl daemon-reload || true
+  elif openrc_available; then
+    rc-service sing-box stop >/dev/null 2>&1 || true
+    rc-update del sing-box default >/dev/null 2>&1 || true
+    rm -f "$OPENRC_SERVICE"
+  fi
+  rm -rf "$CONFIG_DIR"
+  rm -f "$SB_BIN"
+  rm -f "$LOGROTATE_FILE"
+  msg "已卸载。"
+}
+
+show_status() {
+  local active enabled pid
+  if systemd_available; then
+    if systemctl is-active --quiet sing-box; then
+      active="运行中"
+    else
+      active="未运行"
+    fi
+    if systemctl is-enabled --quiet sing-box; then
+      enabled="已设置开机自启"
+    else
+      enabled="未设置开机自启"
+    fi
+    pid="$(systemctl show -p MainPID --value sing-box 2>/dev/null || true)"
+    [ -z "$pid" ] && pid="0"
+    msg "服务状态: ${active}"
+    msg "自启状态: ${enabled}"
+    msg "主进程 PID: ${pid}"
+  elif openrc_available; then
+    if rc-service sing-box status >/dev/null 2>&1; then
+      active="运行中"
+    else
+      active="未运行"
+    fi
+    if rc-update show default 2>/dev/null | awk '{print $1}' | grep -qx "sing-box"; then
+      enabled="已设置开机自启"
+    else
+      enabled="未设置开机自启"
+    fi
+    pid="0"
+    if [ -f "$PID_FILE" ]; then
+      pid="$(cat "$PID_FILE" 2>/dev/null || echo 0)"
+    fi
+    msg "服务状态: ${active}"
+    msg "自启状态: ${enabled}"
+    msg "主进程 PID: ${pid}"
+  else
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" >/dev/null 2>&1; then
+      msg "服务状态: 运行中 (PID $(cat "$PID_FILE"))"
+    else
+      msg "服务状态: 未运行"
+    fi
+  fi
+  if [ -f /var/log/sing-box/sing-box.log ]; then
+    msg "日志路径: /var/log/sing-box/sing-box.log"
+    msg "日志大小: $(stat -c %s /var/log/sing-box/sing-box.log 2>/dev/null || echo 0) 字节"
+  fi
+}
+
+restart_service() {
+  restart_singbox
+  msg "服务已重启。"
+}
+
+main_menu() {
+  local choice
+  while true; do
+    msg ""
+    menu_title "sing-box 一键脚本"
+    msg "${C_DIM}(${OS_NAME} ${OS_VERSION} / ${ARCH_LABEL})${C_RESET}"
+    menu_sep
+    if [ -f "$MANAGER_CONF" ] && [ -x "$SB_BIN" ]; then
+      sanitize_inbounds
+      setup_logrotate
+      menu_item 1 "新增入口"
+      menu_item 2 "修改入口端口"
+      menu_item 3 "修改入口出口"
+      menu_item 4 "自定义出口管理"
+      menu_item 5 "删除入口"
+      menu_item 6 "更新基础配置(SNI/UUID/密钥)"
+      menu_item 7 "显示连接信息"
+      menu_item 8 "查看运行状态"
+      menu_item 9 "重启服务"
+      menu_item 10 "卸载"
+      menu_item 0 "退出"
+      read -r -p "请选择: " choice
+      case "$choice" in
+        1) add_inbound ;;
+        2) change_port ;;
+        3) change_outbound ;;
+        4) manage_custom_outbounds ;;
+        5) remove_inbound ;;
+        6) update_base_config ;;
+        7) show_info ;;
+        8) show_status ;;
+        9) restart_service ;;
+        10) uninstall_all ;;
+        0) exit 0 ;;
+      esac
+    else
+      menu_item 1 "安装"
+      menu_item 0 "退出"
+      read -r -p "请选择: " choice
+      case "$choice" in
+        1) install_flow ;;
+        0) exit 0 ;;
+      esac
+    fi
+  done
+}
+
+need_root
+ensure_bash
+init_colors
+check_os
+ARCH_LABEL="$(get_arch_label)"
+main_menu
