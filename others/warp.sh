@@ -141,19 +141,18 @@ System Information
 
 Install_Requirements_Debian() {
     if [[ ! $(command -v gpg) ]]; then
-        apt update
-        apt install gnupg -y
+        apt-get update -y
+        apt-get install -y --no-install-recommends gnupg
     fi
-    if [[ ! $(apt list 2>/dev/null | grep apt-transport-https | grep installed) ]]; then
-        apt update
-        apt install apt-transport-https -y
-    fi
+    apt-get update -y
+    apt-get install -y --no-install-recommends ca-certificates curl apt-transport-https
 }
 
 Install_WARP_Client_Debian() {
+    local Repo_Arch
     if [[ ${SysInfo_OS_Name_lowercase} = ubuntu ]]; then
         case ${SysInfo_OS_CodeName} in
-        bionic | focal | jammy) ;;
+        bionic | focal | jammy | noble) ;;
         *)
             log ERROR "This operating system is not supported."
             exit 1
@@ -161,23 +160,40 @@ Install_WARP_Client_Debian() {
         esac
     elif [[ ${SysInfo_OS_Name_lowercase} = debian ]]; then
         case ${SysInfo_OS_CodeName} in
-        bookworm | buster | bullseye) ;;
+        bookworm | trixie | buster | bullseye) ;;
         *)
             log ERROR "This operating system is not supported."
             exit 1
             ;;
         esac
     fi
+    case ${SysInfo_Arch} in
+    x86_64 | amd64)
+        Repo_Arch="amd64"
+        ;;
+    aarch64 | arm64)
+        Repo_Arch="arm64"
+        ;;
+    *)
+        log ERROR "This CPU architecture is not supported: ${SysInfo_Arch}"
+        exit 1
+        ;;
+    esac
     Install_Requirements_Debian
-    curl https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${SysInfo_OS_CodeName} main" | tee /etc/apt/sources.list.d/cloudflare-client.list
-    apt update
-    apt install cloudflare-warp -y
+    mkdir -p /usr/share/keyrings
+    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+    chmod 0644 /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+    echo "deb [arch=${Repo_Arch} signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${SysInfo_OS_CodeName} main" | tee /etc/apt/sources.list.d/cloudflare-client.list
+    apt-get update -y
+    apt-get install -y cloudflare-warp
 }
 
 Install_WARP_Client_CentOS() {
     if [[ ${SysInfo_OS_Ver_major} = 8 ]]; then
-        rpm -ivh http://pkg.cloudflareclient.com/cloudflare-release-el8.rpm
+        rpm -ivh https://pkg.cloudflareclient.com/cloudflare-release-el8.rpm
+        yum install cloudflare-warp -y
+    elif [[ ${SysInfo_OS_Ver_major} = 9 ]]; then
+        rpm -ivh https://pkg.cloudflareclient.com/cloudflare-release-el9.rpm
         yum install cloudflare-warp -y
     else
         log ERROR "This operating system is not supported."
@@ -193,10 +209,6 @@ Check_WARP_Client() {
 Install_WARP_Client() {
     Print_System_Info
     log INFO "Installing Cloudflare WARP Client..."
-    if [[ ${SysInfo_Arch} != x86_64 ]]; then
-        log ERROR "This CPU architecture is not supported: ${SysInfo_Arch}"
-        exit 1
-    fi
     case ${SysInfo_OS_Name_lowercase} in
     *debian* | *ubuntu*)
         Install_WARP_Client_Debian
