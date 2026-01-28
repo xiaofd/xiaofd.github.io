@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # 支持: Ubuntu 22.04/24.04, Debian 12/13
-# 架构: amd64 安装 Google Chrome；其他架构安装 Chromium（同源最新稳定版）
+# 架构: amd64 安装 Google Chrome；其他架构安装 Chromium（Ubuntu 走 snap）
 set -euo pipefail
+
+APT_UPDATED=0
 
 need_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -47,36 +49,53 @@ detect_arch() {
   esac
 }
 
+apt_update() {
+  if [ "$APT_UPDATED" -eq 0 ]; then
+    DEBIAN_FRONTEND=noninteractive \
+      apt-get update -y
+    APT_UPDATED=1
+  fi
+}
+
+apt_install() {
+  apt_update
+  DEBIAN_FRONTEND=noninteractive \
+    apt-get install -y --no-install-recommends "$@"
+}
+
 install_chrome_amd64() {
-  apt-get update -y
-  apt-get install -y ca-certificates curl gnupg
+  apt_install ca-certificates curl gnupg
 
   install -m 0755 -d /usr/share/keyrings
-  if [ ! -f /usr/share/keyrings/google-chrome.gpg ]; then
-    curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
-      | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
-  fi
+  curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+    | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+  chmod 0644 /usr/share/keyrings/google-chrome.gpg
 
   cat > /etc/apt/sources.list.d/google-chrome.list <<'EOF'
-deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main
+deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main
 EOF
 
-  apt-get update -y
-  apt-get install -y google-chrome-stable
+  apt_update
+  apt_install google-chrome-stable
 }
 
 install_chromium_debian() {
-  apt-get update -y
-  apt-get install -y chromium
+  apt_install chromium
 }
 
 install_chromium_ubuntu() {
-  apt-get update -y
-  apt-get install -y snapd
+  apt_install snapd
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable --now snapd >/dev/null 2>&1 || true
+  fi
+  if [ -S /run/snapd.socket ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl enable --now snapd.socket >/dev/null 2>&1 || true
+  fi
   if ! command -v snap >/dev/null 2>&1; then
     echo "snap 未就绪，无法安装 Chromium。" >&2
     exit 1
   fi
+  snap wait system seed.loaded || true
   snap install chromium
 }
 
