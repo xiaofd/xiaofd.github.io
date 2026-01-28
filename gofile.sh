@@ -316,6 +316,50 @@ directlink_extract() {
   printf '%s' "$1" | jq -r 'try (.data.directLink // "") catch ""' || true
 }
 
+parse_upload_response() {
+  printf '%s' "$1" | jq -r '
+    .status//"",
+    .data.downloadPage//"",
+    (.data.fileId // .data.id // ""),
+    .data.code//"",
+    .data.guestToken//"",
+    .data.parentFolder//"",
+    .data.parentFolderCode//""
+  ' || true
+}
+
+delete_with_token() {
+  local code="$1" token="$2" content_id="$3" wt="$4" api_server="$5" no_resolve="$6" print_json="$7"
+  api_server="${api_server:-api}"
+  local delete_id="$content_id"
+  if [ -z "$delete_id" ] && [ "$no_resolve" -eq 0 ]; then
+    if [ -z "$wt" ]; then
+      read -r wt api_server < <(get_config)
+    fi
+    local resolve_resp
+    resolve_resp="$(content_fetch "$api_server" "$wt" "$token" "$code" "")"
+    delete_id="$(printf '%s' "$resolve_resp" | jq -r 'try (.data.id // "") catch ""' || true)"
+  fi
+  [ -n "$delete_id" ] || delete_id="$code"
+  local payload response status
+  payload="{\"contentsId\":\"${delete_id}\"}"
+  response="$(curl -sS -X DELETE "https://${api_server}.gofile.io/contents" \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "$payload")"
+  if [ "$print_json" -eq 1 ]; then
+    echo "$response"
+    return 0
+  fi
+  status="$(printf '%s' "$response" | jq -r 'try (.status // "") catch ""' || true)"
+  if [ "$status" != "ok" ]; then
+    echo "$response" >&2
+    return 1
+  fi
+  msg_ok "已删除: $delete_id"
+  return 0
+}
+
 content_select_files() {
   local json="$1" name="$2" fid="$3" all_flag="$4"
   printf '%s' "$json" | jq -r --arg name "$name" --arg fid "$fid" --arg all "$all_flag" '
@@ -412,6 +456,8 @@ cmd_upload() {
   local file="" token="${GOFILE_TOKEN:-}" folder_id="${GOFILE_FOLDER_ID:-}" region="" endpoint="${GOFILE_ENDPOINT:-}"
   local no_progress=0 simple=0 print_json=0 no_manifest=0 want_direct=0 recursive=0
   local encrypt=0 enc_pass="" enc_show=1 enc_cipher="" enc_cipher_user=0 enc_hmac=0 tmp_hmac=""
+  local files_list=()
+  local args=()
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -451,14 +497,45 @@ cmd_upload() {
   --no-manifest           不写入清单
 USAGE
         return 0;;
-      --) shift; break;;
+      --)
+        shift
+        if [ $# -eq 1 ] && [ -z "$file" ]; then
+          file="$1"
+          shift
+          break
+        fi
+        while [ $# -gt 0 ]; do
+          files_list+=("$1")
+          shift
+        done
+        break
+        ;;
       -*) fatal "未知参数: $1";;
       *) if [ -z "$file" ]; then file="$1"; shift; else fatal "多余参数: $1"; fi;;
     esac
   done
 
-  [ -n "$file" ] || fatal "请提供文件路径"
-  ensure_deps curl jq
+  args=()
+  [ -n "$token" ] && args+=(--token "$token")
+  [ -n "$folder_id" ] && args+=(--folder-id "$folder_id")
+  [ -n "$region" ] && args+=(--region "$region")
+  [ -n "$endpoint" ] && args+=(--endpoint "$endpoint")
+  [ "$recursive" -eq 1 ] && args+=(--recursive)
+  [ "$no_progress" -eq 1 ] && args+=(--no-progress)
+  if [ "$encrypt" -eq 1 ]; then
+    args+=(--encrypt --enc-no-show --enc-pass "$enc_pass" --enc-cipher "$enc_cipher")
+    [ "$enc_hmac" -eq 1 ] && args+=(--enc-hmac)
+  fi
+  [ "$simple" -eq 1 ] && args+=(--simple)
+  [ "$print_json" -eq 1 ] && args+=(--json)
+  [ "$want_direct" -eq 1 ] && args+=(--direct)
+  [ "$no_manifest" -eq 1 ] && args+=(--no-manifest)
+
+  local multi_files=()
+  if [ "${#files_list[@]}" -gt 0 ]; then
+    multi_files=("${files_list[@]}")
+  fi
+
   if [ -z "$region" ]; then
     region="${GOFILE_REGION:-}"
   fi
@@ -482,7 +559,7 @@ USAGE
     fi
   fi
 
-  if [ -d "$file" ]; then
+  if [ -n "$file" ] && [ -d "$file" ]; then
     if [ "$recursive" -ne 1 ]; then
       fatal "传入的是目录，请使用 -r/--recursive 递归上传"
     fi
@@ -491,29 +568,131 @@ USAGE
       files+=("$f")
     done < <(find "$file" -type f -print0 | LC_ALL=C sort -z)
     [ "${#files[@]}" -gt 0 ] || fatal "目录为空: $file"
-    msg_info "共发现 ${#files[@]} 个文件，开始上传..."
-    local args=()
-    [ -n "$token" ] && args+=(--token "$token")
-    [ -n "$folder_id" ] && args+=(--folder-id "$folder_id")
-    [ -n "$region" ] && args+=(--region "$region")
-    [ -n "$endpoint" ] && args+=(--endpoint "$endpoint")
-    [ "$no_progress" -eq 1 ] && args+=(--no-progress)
-    [ "$encrypt" -eq 1 ] && args+=(--encrypt --enc-no-show --enc-pass "$enc_pass" --enc-cipher "$enc_cipher")
-    [ "$simple" -eq 1 ] && args+=(--simple)
-    [ "$print_json" -eq 1 ] && args+=(--json)
-    [ "$want_direct" -eq 1 ] && args+=(--direct)
-    [ "$no_manifest" -eq 1 ] && args+=(--no-manifest)
+    multi_files=("${files[@]}")
+    file=""
+  fi
+
+  if [ "${#multi_files[@]}" -gt 0 ]; then
+    ensure_deps curl jq
+    if [ "$simple" -eq 0 ] && [ "$print_json" -eq 0 ]; then
+      msg_info "共发现 ${#multi_files[@]} 个文件，开始上传..."
+    fi
     local idx=1
-    for f in "${files[@]}"; do
-      msg_info "[$idx/${#files[@]}] 上传: $f"
-      cmd_upload "${args[@]}" -- "$f"
+    local token_out="$token"
+    local share_folder_id="$folder_id"
+    local share_code=""
+    local last_code=""
+    local wt="" api_server=""
+    if [ "$want_direct" -eq 1 ]; then
+      read -r wt api_server < <(get_config)
+    fi
+    for f in "${multi_files[@]}"; do
+      if [ "$simple" -eq 0 ] && [ "$print_json" -eq 0 ]; then
+        msg_info "[$idx/${#multi_files[@]}] 上传: $f"
+      fi
+      local call_args=()
+      [ -n "$token_out" ] && call_args+=(--token "$token_out")
+      [ -n "$share_folder_id" ] && call_args+=(--folder-id "$share_folder_id")
+      [ -n "$region" ] && call_args+=(--region "$region")
+      [ -n "$endpoint" ] && call_args+=(--endpoint "$endpoint")
+      [ "$no_progress" -eq 1 ] && call_args+=(--no-progress)
+      if [ "$encrypt" -eq 1 ]; then
+        call_args+=(--encrypt --enc-no-show --enc-pass "$enc_pass" --enc-cipher "$enc_cipher")
+        [ "$enc_hmac" -eq 1 ] && call_args+=(--enc-hmac)
+      fi
+      call_args+=(--json --no-manifest)
+      local resp
+      resp="$(cmd_upload "${call_args[@]}" "$f")"
+      local parsed_lines status download file_id code guest_token parent_folder parent_folder_code
+      mapfile -t parsed_lines < <(parse_upload_response "$resp")
+      status="${parsed_lines[0]:-}"
+      download="${parsed_lines[1]:-}"
+      file_id="${parsed_lines[2]:-}"
+      code="${parsed_lines[3]:-}"
+      guest_token="${parsed_lines[4]:-}"
+      parent_folder="${parsed_lines[5]:-}"
+      parent_folder_code="${parsed_lines[6]:-}"
+      [ "$status" = "ok" ] || fatal "上传失败"
+      [ -n "$download" ] || fatal "上传成功但缺少下载页链接"
+      if [ -z "$code" ] && [ -n "$download" ]; then
+        code="$(extract_code "$download")"
+      fi
+      [ -n "$token_out" ] || token_out="$guest_token"
+      [ -n "$share_folder_id" ] || share_folder_id="$parent_folder"
+      if [ -z "$share_code" ] && [ -n "$parent_folder_code" ]; then
+        share_code="$parent_folder_code"
+      fi
+      [ -n "$last_code" ] || last_code="$code"
+      if [ -z "$share_folder_id" ] && [ "$idx" -eq 1 ] && [ "${#multi_files[@]}" -gt 1 ]; then
+        msg_warn "未获取 folderId，后续文件可能无法合并分享"
+      fi
+      if [ "$print_json" -eq 1 ]; then
+        echo "$resp"
+        idx=$((idx+1))
+        continue
+      fi
+      if [ "$no_manifest" -eq 0 ]; then
+        local file_size=""
+        file_size="$(stat -c%s "$f" 2>/dev/null || wc -c <"$f")"
+        local direct_link=""
+        if [ "$want_direct" -eq 1 ] && [ -n "$token_out" ]; then
+          if [ -n "$file_id" ]; then
+            local dl_resp
+            dl_resp="$(directlink_create "$api_server" "$token_out" "$file_id")"
+            direct_link="$(directlink_extract "$dl_resp")"
+            if [ -z "$direct_link" ]; then
+              msg_warn "直链不可用（需要 Premium Token）"
+            fi
+          else
+            msg_warn "未获取文件ID，无法生成直链"
+          fi
+        fi
+        manifest_add "$f" "$file_size" "$download" "$direct_link" "$token_out" "$code" "$file_id" ""
+      fi
       idx=$((idx+1))
     done
+    if [ "$print_json" -eq 1 ]; then
+      return 0
+    fi
+    if [ -z "$share_code" ]; then
+      if [ -n "$last_code" ]; then
+        msg_warn "未获取文件夹分享码，改用单文件链接代替"
+        share_code="$last_code"
+      fi
+    fi
+    if [ "$simple" -eq 1 ]; then
+      if [ -n "$share_code" ]; then
+        echo "https://gofile.io/d/${share_code}"
+      else
+        msg_warn "未获取文件夹分享链接"
+      fi
+      return 0
+    fi
+    if [ -n "$share_code" ]; then
+      echo -e "${C_GREEN}分享链接:${C_RESET} https://gofile.io/d/${share_code}"
+    else
+      msg_warn "未获取文件夹分享链接"
+    fi
+    [ -n "$token_out" ] && echo -e "${C_CYAN}Token:${C_RESET} $token_out"
     if [ "$encrypt" -eq 1 ] && [ "$enc_show" -eq 1 ]; then
       echo -e "${C_CYAN}加密密码:${C_RESET} $enc_pass"
+      echo -e "${C_CYAN}加密算法:${C_RESET} $enc_cipher"
+      if [ "$enc_hmac" -eq 1 ]; then
+        echo -e "${C_CYAN}完整性校验:${C_RESET} HMAC-SHA256 (文件名后缀 .hmac)"
+      fi
+      if [ -n "$share_code" ]; then
+        local dl_cmd
+        dl_cmd="./gofile.sh download --all --dec-pass '$enc_pass' --dec-cipher $enc_cipher"
+        [ "$enc_hmac" -eq 1 ] && dl_cmd="$dl_cmd --dec-hmac"
+        dl_cmd="$dl_cmd https://gofile.io/d/${share_code}"
+        echo -e "${C_CYAN}下载解密命令:${C_RESET} $dl_cmd"
+      fi
     fi
     return 0
   fi
+
+  [ -n "$file" ] || fatal "请提供文件路径"
+  ensure_deps curl jq
   [ -f "$file" ] || fatal "文件不存在: $file"
 
   if [ -z "$endpoint" ]; then
@@ -534,7 +713,7 @@ USAGE
 
   local tmp_resp
   tmp_resp="$(mktemp)"
-  trap 'rm -f "$tmp_resp" "${tmp_hmac:-}"' RETURN
+  trap 'rm -f "${tmp_resp:-}" "${tmp_hmac:-}"' RETURN
   local file_size=""
   file_size="$(stat -c%s "$file" 2>/dev/null || wc -c <"$file")"
 
@@ -570,21 +749,15 @@ USAGE
   local response
   response="$(cat "$tmp_resp")"
 
-  local parsed_lines status download file_id code guest_token parent_folder
-  mapfile -t parsed_lines < <(printf '%s' "$response" | jq -r '
-    .status//"",
-    .data.downloadPage//"",
-    (.data.fileId // .data.id // ""),
-    .data.code//"",
-    .data.guestToken//"",
-    .data.parentFolder//""
-  ' || true)
+  local parsed_lines status download file_id code guest_token parent_folder parent_folder_code
+  mapfile -t parsed_lines < <(parse_upload_response "$response")
   status="${parsed_lines[0]:-}"
   download="${parsed_lines[1]:-}"
   file_id="${parsed_lines[2]:-}"
   code="${parsed_lines[3]:-}"
   guest_token="${parsed_lines[4]:-}"
   parent_folder="${parsed_lines[5]:-}"
+  parent_folder_code="${parsed_lines[6]:-}"
 
   [ "$status" = "ok" ] || fatal "上传失败"
   [ -n "$download" ] || fatal "上传成功但缺少下载页链接"
@@ -615,6 +788,10 @@ USAGE
 
   if [ "$print_json" -eq 1 ]; then
     echo "$response"
+    return 0
+  fi
+  if [ "$simple" -eq 1 ]; then
+    echo "$download"
     return 0
   fi
 
@@ -1192,12 +1369,10 @@ USAGE
     else
       IFS=',' read -r -a picks <<< "$selection"
     fi
-    local args=()
-    [ -n "$token" ] && args+=(--token "$token")
-    [ -n "$wt" ] && args+=(--wt "$wt")
-    [ -n "$api_server" ] && args+=(--api-server "$api_server")
-    [ "$no_resolve" -eq 1 ] && args+=(--no-resolve)
-    [ "$print_json" -eq 1 ] && args+=(--json)
+    local -a codes_order=()
+    local -A seen_code=()
+    local -A token_by_code=()
+    local -A content_by_code=()
     for p in "${picks[@]}"; do
       p="$(printf '%s' "$p" | tr -d ' ')"
       if ! printf '%s' "$p" | grep -Eq '^[0-9]+$'; then
@@ -1208,7 +1383,37 @@ USAGE
         msg_warn "序号超出范围: $p"
         continue
       fi
-      cmd_delete "${args[@]}" "$p"
+      entry="${entries[$((p-1))]}"
+      code="$(printf '%s' "$entry" | jq -r '.code // ""')"
+      [ -n "$code" ] || { msg_warn "序号 $p 无有效 Code，跳过"; continue; }
+      t="$(printf '%s' "$entry" | jq -r '.token // ""')"
+      cid="$(printf '%s' "$entry" | jq -r '.content_id // ""')"
+      if [ -z "${seen_code[$code]+x}" ]; then
+        seen_code["$code"]=1
+        codes_order+=("$code")
+      fi
+      if [ -n "$t" ]; then
+        token_by_code["$code"]="$t"
+      fi
+      if [ -n "$cid" ]; then
+        content_by_code["$code"]="$cid"
+      fi
+    done
+    for code in "${codes_order[@]}"; do
+      token_use="$token"
+      if [ -z "$token_use" ]; then
+        token_use="${token_by_code[$code]:-}"
+      fi
+      if [ -z "$token_use" ]; then
+        msg_warn "跳过（无 Token）: $code"
+        continue
+      fi
+      content_id_use="${content_by_code[$code]:-}"
+      if ! delete_with_token "$code" "$token_use" "$content_id_use" "$wt" "$api_server" "$no_resolve" "$print_json"; then
+        msg_err "删除失败: $code"
+        continue
+      fi
+      manifest_remove_by_codes "$code"
     done
     return 0
   fi
@@ -1242,44 +1447,10 @@ USAGE
     token="$token_from_manifest"
   fi
   [ -n "$token" ] || fatal "需要 Token（请传 --token 或确保清单中有记录）"
-
-  api_server="${api_server:-api}"
-  if [ -z "$wt" ] && [ "$no_resolve" -eq 0 ]; then
-    read -r wt api_server < <(get_config)
+  if ! delete_with_token "$code" "$token" "$content_id" "$wt" "$api_server" "$no_resolve" "$print_json"; then
+    fatal "删除失败"
   fi
-
-  if [ -z "$content_id" ] && [ "$no_resolve" -eq 0 ]; then
-    local resolve_resp
-    resolve_resp="$(content_fetch "$api_server" "$wt" "$token" "$code" "")"
-    content_id="$(printf '%s' "$resolve_resp" | jq -r 'try (.data.id // "") catch ""' || true)"
-  fi
-
-  local delete_id="$content_id"
-  if [ -z "$delete_id" ]; then
-    delete_id="$code"
-  fi
-
-  local payload response
-  payload="{\"contentsId\":\"${delete_id}\"}"
-  response="$(curl -sS -X DELETE "https://${api_server}.gofile.io/contents" \
-    -H "Authorization: Bearer ${token}" \
-    -H "Content-Type: application/json" \
-    -d "$payload")"
-
-  if [ "$print_json" -eq 1 ]; then
-    echo "$response"
-    return 0
-  fi
-
-  local status
-  status="$(printf '%s' "$response" | jq -r 'try (.status // "") catch ""' || true)"
-
-  [ "$status" = "ok" ] || { echo "$response" >&2; fatal "删除失败"; }
-  msg_ok "已删除: $delete_id"
-
-  if [ -n "$code" ]; then
-    manifest_remove_by_codes "$code"
-  fi
+  [ -n "$code" ] && manifest_remove_by_codes "$code"
 }
 
 cmd_list() {
