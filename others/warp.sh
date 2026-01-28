@@ -382,13 +382,13 @@ Install_WireGuardTools_Debian() {
         ;;
     esac
     apt update
-    apt install iproute2 openresolv -y
+    apt install iproute2 openresolv iptables -y
     apt install wireguard-tools --no-install-recommends -y
 }
 
 Install_WireGuardTools_Ubuntu() {
     apt update
-    apt install iproute2 openresolv -y
+    apt install iproute2 openresolv iptables -y
     apt install wireguard-tools --no-install-recommends -y
 }
 
@@ -402,7 +402,7 @@ Install_WireGuardTools_Fedora() {
 }
 
 Install_WireGuardTools_Arch() {
-    pacman -Sy iproute2 openresolv wireguard-tools --noconfirm
+    pacman -Sy iproute2 openresolv wireguard-tools iptables --noconfirm
 }
 
 Install_WireGuardTools() {
@@ -452,6 +452,43 @@ Check_WireGuard() {
     WireGuard_SelfStart=$(systemctl is-enabled wg-quick@${WireGuard_Interface} 2>/dev/null)
 }
 
+Check_WireGuard_Dependencies() {
+    if [[ ${SysInfo_Virt} = lxc* || ${SysInfo_Virt} = openvz* ]]; then
+        log WARN "检测到容器环境(${SysInfo_Virt})，WireGuard 需要 TUN + NET_ADMIN 权限"
+        if [[ -r /proc/1/uid_map ]]; then
+            local uid_map
+            uid_map="$(awk 'NR==1{print $2}' /proc/1/uid_map)"
+            if [[ -n ${uid_map} && ${uid_map} != 0 ]]; then
+                log WARN "当前可能是 LXC 非特权容器（unprivileged），iptables/WireGuard 可能被限制"
+            fi
+        fi
+        log INFO "请确保宿主机已允许 TUN 设备、授予 NET_ADMIN 能力，并允许 iptables/ip6tables 操作"
+    fi
+    if [[ ! -c /dev/net/tun ]]; then
+        log ERROR "/dev/net/tun 不存在，无法创建 WireGuard 接口（LXC 需开启 TUN/NET_ADMIN）"
+        exit 1
+    fi
+    if ! command -v ip6tables-restore >/dev/null 2>&1; then
+        log INFO "缺少 ip6tables-restore，尝试安装 iptables..."
+        if command -v apt >/dev/null 2>&1; then
+            apt update
+            apt install -y iptables
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y iptables
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y iptables
+        elif command -v pacman >/dev/null 2>&1; then
+            pacman -Sy --noconfirm iptables
+        elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache iptables
+        fi
+    fi
+    if ! command -v ip6tables-restore >/dev/null 2>&1; then
+        log ERROR "缺少 ip6tables-restore（请安装 iptables / iptables-nft）"
+        exit 1
+    fi
+}
+
 Install_WireGuard() {
     Print_System_Info
     Check_WireGuard
@@ -465,6 +502,7 @@ Install_WireGuard() {
 
 Start_WireGuard() {
     Check_WARP_Client
+    Check_WireGuard_Dependencies
     log INFO "Starting WireGuard..."
     if [[ ${WARP_Client_Status} = active ]]; then
         systemctl stop warp-svc
@@ -485,6 +523,7 @@ Start_WireGuard() {
 
 Restart_WireGuard() {
     Check_WARP_Client
+    Check_WireGuard_Dependencies
     log INFO "Restarting WireGuard..."
     if [[ ${WARP_Client_Status} = active ]]; then
         systemctl stop warp-svc
