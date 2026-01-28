@@ -341,6 +341,11 @@ delete_with_token() {
     delete_id="$(printf '%s' "$resolve_resp" | jq -r 'try (.data.id // "") catch ""' || true)"
   fi
   [ -n "$delete_id" ] || delete_id="$code"
+  if [ "$no_resolve" -eq 1 ] && [ -z "$content_id" ]; then
+    if ! printf '%s' "$delete_id" | grep -Eq '^[0-9a-fA-F-]{32,36}$'; then
+      msg_warn "未解析 content_id，使用 Code 删除可能失败（建议不要加 --no-resolve）"
+    fi
+  fi
   local payload response status
   payload="{\"contentsId\":\"${delete_id}\"}"
   response="$(curl -sS -X DELETE "https://${api_server}.gofile.io/contents" \
@@ -1157,6 +1162,10 @@ USAGE
     done <<< "$all_files"
   fi
 
+  if [ "$direct" -ne 1 ]; then
+    msg_warn "提示: 网页链接可能会跳转为下载页；如需稳定下载请使用 --direct。"
+  fi
+
   while IFS=$'\t' read -r file_id file_name file_link file_size; do
     [ -n "$file_id" ] || continue
     local url="$file_link"
@@ -1167,8 +1176,6 @@ USAGE
         msg_warn "直链不可用（需要 Premium Token）: $file_name"
         continue
       fi
-    else
-      msg_warn "提示: 网页链接可能会跳转为下载页；如需稳定下载请使用 --direct。"
     fi
 
     local out_path="${outdir%/}/$file_name"
@@ -1196,15 +1203,15 @@ USAGE
         out_dec="${outdir%/}/${file_name}.dec"
       fi
       local tmp_dec="${out_dec}.part"
-    if [ -f "$out_dec" ]; then
-      msg_warn "已存在，跳过: $out_dec"
-      continue
-    fi
-    local curl_args=( -L -A "$USER_AGENT" -e "https://gofile.io/d/$code"
-      -H "Authorization: Bearer ${token}" -b "accountToken=${token}" "$url" )
-    [ "$no_progress" -eq 1 ] && curl_args+=( -sS )
+      if [ -f "$out_dec" ]; then
+        msg_warn "已存在，跳过: $out_dec"
+        continue
+      fi
+      local curl_args=( -L -A "$USER_AGENT" -e "https://gofile.io/d/$code"
+        -H "Authorization: Bearer ${token}" -b "accountToken=${token}" "$url" )
+      [ "$no_progress" -eq 1 ] && curl_args+=( -sS )
       if [ "$dec_hmac" -eq 1 ]; then
-        local hmac_file expected_hmac actual_hmac
+        local hmac_file expected_hmac actual_hmac hmac_key
         hmac_file="${outdir%/}/${file_name}.hmac"
         if [ ! -f "$hmac_file" ]; then
           msg_err "缺少 HMAC 文件: $hmac_file"
@@ -1219,8 +1226,8 @@ USAGE
           continue
         fi
         expected_hmac="$(cat "$hmac_file" | tr -d '\r\n')"
-        HMAC_KEY="$(derive_hmac_key "$dec_pass")" \
-          actual_hmac="$(openssl dgst -sha256 -hmac "$HMAC_KEY" -binary "$tmp_dec" | xxd -p -c 256)"
+        hmac_key="$(derive_hmac_key "$dec_pass")"
+        actual_hmac="$(openssl dgst -sha256 -hmac "$hmac_key" -binary "$tmp_dec" | xxd -p -c 256)"
         if [ -z "$expected_hmac" ] || [ "$expected_hmac" != "$actual_hmac" ]; then
           rm -f "$tmp_dec"
           msg_err "HMAC 校验失败: $file_name"
@@ -1350,6 +1357,20 @@ USAGE
         "$C_YELLOW" "${code:-}" "$C_RESET" >&2
       idx=$((idx+1))
     done
+    local -A code_seen=()
+    local has_dup=0
+    for entry in "${entries[@]}"; do
+      code="$(printf '%s' "$entry" | jq -r '.code // ""')"
+      [ -n "$code" ] || continue
+      if [ -n "${code_seen[$code]+x}" ]; then
+        has_dup=1
+        break
+      fi
+      code_seen["$code"]=1
+    done
+    if [ "$has_dup" -eq 1 ]; then
+      msg_warn "注意：同一 Code 只会删除一次（代表同一分享）"
+    fi
     echo -e "${C_BOLD}选择删除:${C_RESET} 输入序号（可逗号分隔，如 1,3,5）；" >&2
     echo -e "          输入 ${C_YELLOW}a${C_RESET} 删除全部，${C_YELLOW}q${C_RESET} 取消。" >&2
     printf "%s> %s" "$C_BLUE" "$C_RESET" >&2
@@ -1499,8 +1520,13 @@ USAGE
   fi
 
   local deleted_codes=()
+  local -A seen_code=()
   while IFS=$'\t' read -r code content_id token download file_path; do
     [ -n "$code" ] || continue
+    if [ -n "${seen_code[$code]+x}" ]; then
+      continue
+    fi
+    seen_code["$code"]=1
     if [ "$dry_run" -eq 1 ]; then
       msg_warn "将删除: $code ($file_path)"
       continue
