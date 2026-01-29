@@ -423,6 +423,97 @@ port_is_listening() {
   fi
 }
 
+pick_free_port() {
+  local port i
+  for i in $(seq 1 50); do
+    port=$((RANDOM % 20000 + 30000))
+    if ! port_is_listening "$port"; then
+      echo "$port"
+      return 0
+    fi
+  done
+  echo "39000"
+}
+
+wait_port_listen() {
+  local port="$1" i
+  if ! cmd_exists ss; then
+    sleep 0.6
+    return 0
+  fi
+  for i in $(seq 1 20); do
+    if port_is_listening "$port"; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+test_outbound() {
+  local tag="$1"
+  [ -n "$tag" ] || return 0
+  local outbound_file endpoint_file
+  outbound_file="${OUTBOUNDS_DIR}/${tag}.json"
+  endpoint_file="${ENDPOINTS_DIR}/${tag}.json"
+  if [ ! -f "$outbound_file" ] && [ ! -f "$endpoint_file" ]; then
+    ui "跳过出口测试：未找到配置 ${tag}"
+    return 0
+  fi
+  if [ ! -x "$SB_BIN" ]; then
+    ui "跳过出口测试：未找到 sing-box"
+    return 0
+  fi
+  if ! cmd_exists curl; then
+    ui "跳过出口测试：未安装 curl"
+    return 0
+  fi
+  if [ ! -f "$outbound_file" ] && [ -f "$endpoint_file" ]; then
+    ui "出口 ${tag} 为 endpoints 类型，暂不支持自动测试"
+    return 0
+  fi
+  local port cfg logf pid ip
+  port="$(pick_free_port)"
+  cfg="$(tmp_path outbound-test.json)"
+  logf="$(tmp_path outbound-test.log)"
+  cat > "$cfg" <<EOF
+{
+  "log": {"disabled": true},
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "test-in",
+      "listen": "127.0.0.1",
+      "listen_port": ${port}
+    }
+  ],
+  "outbounds": [
+$(sed 's/^/    /' "$outbound_file")
+  ],
+  "route": {
+    "rules": [
+      {
+        "inbound": ["test-in"],
+        "outbound": "$(json_escape "$tag")"
+      }
+    ]
+  }
+}
+EOF
+  "$SB_BIN" run -c "$cfg" >"$logf" 2>&1 &
+  pid=$!
+  wait_port_listen "$port" || true
+  ip="$(curl -fsSL --max-time 8 --socks5-hostname 127.0.0.1:${port} https://ip.sb 2>/dev/null || true)"
+  kill "$pid" >/dev/null 2>&1 || true
+  wait "$pid" >/dev/null 2>&1 || true
+  rm -f "$cfg" "$logf"
+  if [ -n "$ip" ]; then
+    msg "出口 ${tag} 测试成功，出口 IP: ${ip}"
+  else
+    ui "出口 ${tag} 测试失败（无法访问 ip.sb）"
+  fi
+}
+
 prompt_port() {
   local port ans
   while true; do
@@ -924,6 +1015,142 @@ build_hy2_outbound() {
 EOF
 }
 
+build_socks_outbound() {
+  local link="$1" tag="$2"
+  local scheme base qs userinfo hostport host port user pass version
+
+  scheme="${link%%://*}"
+  link="${link#*://}"
+  if echo "$link" | grep -q '#'; then
+    link="${link%%#*}"
+  fi
+  if echo "$link" | grep -q '\?'; then
+    qs="${link#*\?}"
+    base="${link%%\?*}"
+  else
+    qs=""
+    base="$link"
+  fi
+
+  if echo "$base" | grep -q '@'; then
+    userinfo="${base%%@*}"
+    hostport="${base#*@}"
+  else
+    userinfo=""
+    hostport="$base"
+  fi
+
+  IFS='|' read -r host port <<< "$(parse_hostport "$hostport")"
+  [ -z "$port" ] && port="1080"
+  [ -z "$host" ] && die "SOCKS 缺少地址。"
+
+  if [ -n "$userinfo" ]; then
+    if echo "$userinfo" | grep -q ':'; then
+      user="${userinfo%%:*}"
+      pass="${userinfo#*:}"
+    else
+      user="$userinfo"
+      pass=""
+    fi
+    user="$(urldecode "$user")"
+    pass="$(urldecode "$pass")"
+  else
+    user=""
+    pass=""
+  fi
+
+  case "$scheme" in
+    socks4) version="4" ;;
+    socks4a) version="4a" ;;
+    socks5|socks) version="5" ;;
+    *) version="5" ;;
+  esac
+
+  cat > "${OUTBOUNDS_DIR}/${tag}.json" <<EOF
+{
+  "type": "socks",
+  "tag": "$(json_escape "$tag")",
+  "server": "$(json_escape "$host")",
+  "server_port": ${port},
+  "version": "$(json_escape "$version")"$( [ -n "$user" ] && printf ',\n  "username": "%s",\n  "password": "%s"' "$(json_escape "$user")" "$(json_escape "$pass")" )
+}
+EOF
+}
+
+build_http_outbound() {
+  local link="$1" tag="$2"
+  local scheme base qs userinfo hostport host port user pass sni insecure path
+
+  scheme="${link%%://*}"
+  link="${link#*://}"
+  if echo "$link" | grep -q '#'; then
+    link="${link%%#*}"
+  fi
+  if echo "$link" | grep -q '\?'; then
+    qs="${link#*\?}"
+    base="${link%%\?*}"
+  else
+    qs=""
+    base="$link"
+  fi
+
+  if echo "$base" | grep -q '@'; then
+    userinfo="${base%%@*}"
+    hostport="${base#*@}"
+  else
+    userinfo=""
+    hostport="$base"
+  fi
+
+  IFS='|' read -r host port <<< "$(parse_hostport "$hostport")"
+  if [ -z "$port" ]; then
+    if [ "$scheme" = "https" ]; then
+      port="443"
+    else
+      port="80"
+    fi
+  fi
+  [ -z "$host" ] && die "HTTP 代理缺少地址。"
+
+  if [ -n "$userinfo" ]; then
+    if echo "$userinfo" | grep -q ':'; then
+      user="${userinfo%%:*}"
+      pass="${userinfo#*:}"
+    else
+      user="$userinfo"
+      pass=""
+    fi
+    user="$(urldecode "$user")"
+    pass="$(urldecode "$pass")"
+  else
+    user=""
+    pass=""
+  fi
+
+  sni="$(urldecode "$(get_query_param sni "$qs")")"
+  insecure="$(get_query_param insecure "$qs")"
+  [ -z "$insecure" ] && insecure="$(get_query_param allowInsecure "$qs")"
+  path="$(urldecode "$(get_query_param path "$qs")")"
+
+  local tls_block=""
+  if [ "$scheme" = "https" ]; then
+    local tls_items="\"enabled\":true,\"server_name\":\"$(json_escape "${sni:-$host}")\""
+    if [ "$insecure" = "1" ] || [ "$insecure" = "true" ]; then
+      tls_items="${tls_items},\"insecure\":true"
+    fi
+    tls_block=",\n  \"tls\": {${tls_items}}"
+  fi
+
+  cat > "${OUTBOUNDS_DIR}/${tag}.json" <<EOF
+{
+  "type": "http",
+  "tag": "$(json_escape "$tag")",
+  "server": "$(json_escape "$host")",
+  "server_port": ${port}$( [ -n "$user" ] && printf ',\n  "username": "%s",\n  "password": "%s"' "$(json_escape "$user")" "$(json_escape "$pass")" )$( [ -n "$path" ] && printf ',\n  "path": "%s"' "$(json_escape "$path")" )${tls_block}
+}
+EOF
+}
+
 build_outbound_from_link() {
   local link="$1" tag="$2"
   case "$link" in
@@ -932,6 +1159,8 @@ build_outbound_from_link() {
     trojan://*) build_trojan_outbound "$link" "$tag" ;;
     ss://*) build_ss_outbound "$link" "$tag" ;;
     hysteria2://*|hy2://*) build_hy2_outbound "$link" "$tag" ;;
+    socks://*|socks4://*|socks4a://*|socks5://*) build_socks_outbound "$link" "$tag" ;;
+    http://*|https://*) build_http_outbound "$link" "$tag" ;;
     *) die "不支持的链接协议。" ;;
   esac
 }
@@ -1130,7 +1359,7 @@ add_custom_outbound() {
     fi
     break
   done
-  read -r -p "请输入出口链接(VLESS/VMess/Trojan/SS/HY2): " link
+  read -r -p "请输入出口链接(VLESS/VMess/Trojan/SS/HY2/SOCKS/HTTP/HTTPS): " link
   build_outbound_from_link "$link" "$tag"
   save_outbound_link "$tag" "$link"
   echo "$tag"
@@ -1142,8 +1371,10 @@ add_custom_outbound_only() {
   if [ -s "$INBOUNDS_FILE" ]; then
     build_config
     restart_singbox
+    test_outbound "$tag"
     msg "自定义出口已添加: ${tag}"
   else
+    test_outbound "$tag"
     msg "自定义出口已添加: ${tag} (当前无入口，未重启)"
   fi
 }
@@ -1162,6 +1393,7 @@ update_custom_outbound() {
     build_config
     restart_singbox
   fi
+  test_outbound "$tag"
   msg "自定义出口已更新: ${tag}"
 }
 
@@ -1279,6 +1511,7 @@ add_inbound() {
   echo "${tag}|${port}|${out_tag}|${remark}" >> "$INBOUNDS_FILE"
   build_config
   restart_singbox
+  test_outbound "$out_tag"
   msg "入口已添加。"
 }
 
@@ -1382,6 +1615,7 @@ change_outbound() {
   update_inbound_line "$idx" "" "$new_out"
   build_config
   restart_singbox
+  test_outbound "$new_out"
   msg "出口已更新。"
 }
 

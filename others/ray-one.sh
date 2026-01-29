@@ -404,6 +404,92 @@ port_is_listening() {
   fi
 }
 
+pick_free_port() {
+  local port i
+  for i in $(seq 1 50); do
+    port=$((RANDOM % 20000 + 30000))
+    if ! port_is_listening "$port"; then
+      echo "$port"
+      return 0
+    fi
+  done
+  echo "39000"
+}
+
+wait_port_listen() {
+  local port="$1" i
+  if ! cmd_exists ss; then
+    sleep 0.6
+    return 0
+  fi
+  for i in $(seq 1 20); do
+    if port_is_listening "$port"; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+test_outbound() {
+  local tag="$1"
+  [ -n "$tag" ] || return 0
+  if [ ! -f "${OUTBOUNDS_DIR}/${tag}.json" ]; then
+    ui "跳过出口测试：未找到配置 ${tag}"
+    return 0
+  fi
+  if [ ! -x "$XRAY_BIN" ]; then
+    ui "跳过出口测试：未找到 xray"
+    return 0
+  fi
+  if ! cmd_exists curl; then
+    ui "跳过出口测试：未安装 curl"
+    return 0
+  fi
+  local port cfg logf pid ip
+  port="$(pick_free_port)"
+  cfg="$(tmp_path outbound-test.json)"
+  logf="$(tmp_path outbound-test.log)"
+  cat > "$cfg" <<EOF
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [
+    {
+      "tag": "test-in",
+      "listen": "127.0.0.1",
+      "port": ${port},
+      "protocol": "socks",
+      "settings": {"udp": true}
+    }
+  ],
+  "outbounds": [
+$(sed 's/^/    /' "${OUTBOUNDS_DIR}/${tag}.json")
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["test-in"],
+        "outboundTag": "${tag}"
+      }
+    ]
+  }
+}
+EOF
+  "$XRAY_BIN" run -c "$cfg" >"$logf" 2>&1 &
+  pid=$!
+  wait_port_listen "$port" || true
+  ip="$(curl -fsSL --max-time 8 --socks5-hostname 127.0.0.1:${port} https://ip.sb 2>/dev/null || true)"
+  kill "$pid" >/dev/null 2>&1 || true
+  wait "$pid" >/dev/null 2>&1 || true
+  rm -f "$cfg" "$logf"
+  if [ -n "$ip" ]; then
+    msg "出口 ${tag} 测试成功，出口 IP: ${ip}"
+  else
+    ui "出口 ${tag} 测试失败（无法访问 ip.sb）"
+  fi
+}
+
 prompt_port() {
   local port ans
   while true; do
@@ -871,6 +957,261 @@ build_ss_outbound() {
 EOF
 }
 
+build_hy2_outbound() {
+  local link="$1" tag="$2"
+  local base qs userinfo hostport host port password
+  local sni insecure alpn up down auth
+
+  link="${link#hysteria2://}"
+  link="${link#hy2://}"
+  if echo "$link" | grep -q '#'; then
+    link="${link%%#*}"
+  fi
+  if echo "$link" | grep -q '\?'; then
+    qs="${link#*\?}"
+    base="${link%%\?*}"
+  else
+    qs=""
+    base="$link"
+  fi
+
+  userinfo="${base%%@*}"
+  hostport="${base#*@}"
+  IFS='|' read -r host port <<< "$(parse_hostport "$hostport")"
+
+  if echo "$userinfo" | grep -q ':'; then
+    password="${userinfo#*:}"
+  else
+    password="$userinfo"
+  fi
+
+  auth="$(urldecode "$(get_query_param auth "$qs")")"
+  [ -n "$auth" ] && password="$auth"
+  sni="$(urldecode "$(get_query_param sni "$qs")")"
+  alpn="$(urldecode "$(get_query_param alpn "$qs")")"
+  insecure="$(get_query_param insecure "$qs")"
+  [ -z "$insecure" ] && insecure="$(get_query_param allowInsecure "$qs")"
+  up="$(get_query_param upmbps "$qs")"
+  [ -z "$up" ] && up="$(get_query_param up_mbps "$qs")"
+  down="$(get_query_param downmbps "$qs")"
+  [ -z "$down" ] && down="$(get_query_param down_mbps "$qs")"
+
+  [ -z "$host" ] && die "HY2 缺少地址。"
+  [ -z "$port" ] && die "HY2 缺少端口。"
+  password="$(urldecode "$password")"
+  [ -z "$password" ] && die "HY2 缺少密码。"
+
+  local tls_items=""
+  local tls_sni="${sni:-$host}"
+  tls_items="\"serverName\":\"${tls_sni}\""
+  if [ -n "$alpn" ]; then
+    tls_items="${tls_items},\"alpn\":$(json_array_from_csv "$alpn")"
+  fi
+  if [ "$insecure" = "1" ] || [ "$insecure" = "true" ]; then
+    tls_items="${tls_items},\"allowInsecure\":true"
+  fi
+
+  local hy_items="\"version\":2,\"auth\":\"${password}\""
+  if [ -n "$up" ]; then
+    hy_items="${hy_items},\"up\":\"${up}\""
+  fi
+  if [ -n "$down" ]; then
+    hy_items="${hy_items},\"down\":\"${down}\""
+  fi
+
+  cat > "${OUTBOUNDS_DIR}/${tag}.json" <<EOF
+{
+  "tag": "${tag}",
+  "protocol": "hysteria",
+  "settings": {
+    "address": "${host}",
+    "port": ${port}
+  },
+  "streamSettings": {
+    "network": "hysteria",
+    "security": "tls",
+    "hysteriaSettings": {
+      ${hy_items}
+    },
+    "tlsSettings": {
+      ${tls_items}
+    }
+  }
+}
+EOF
+}
+
+build_socks_outbound() {
+  local link="$1" tag="$2"
+  local scheme base qs userinfo hostport host port user pass version
+
+  scheme="${link%%://*}"
+  link="${link#*://}"
+  if echo "$link" | grep -q '#'; then
+    link="${link%%#*}"
+  fi
+  if echo "$link" | grep -q '\?'; then
+    qs="${link#*\?}"
+    base="${link%%\?*}"
+  else
+    qs=""
+    base="$link"
+  fi
+
+  if echo "$base" | grep -q '@'; then
+    userinfo="${base%%@*}"
+    hostport="${base#*@}"
+  else
+    userinfo=""
+    hostport="$base"
+  fi
+
+  IFS='|' read -r host port <<< "$(parse_hostport "$hostport")"
+  [ -z "$port" ] && port="1080"
+  [ -z "$host" ] && die "SOCKS 缺少地址。"
+
+  if [ -n "$userinfo" ]; then
+    if echo "$userinfo" | grep -q ':'; then
+      user="${userinfo%%:*}"
+      pass="${userinfo#*:}"
+    else
+      user="$userinfo"
+      pass=""
+    fi
+    user="$(urldecode "$user")"
+    pass="$(urldecode "$pass")"
+  else
+    user=""
+    pass=""
+  fi
+
+  case "$scheme" in
+    socks4) version="4" ;;
+    socks4a) version="4a" ;;
+    socks5|socks) version="5" ;;
+    *) version="5" ;;
+  esac
+
+  if [ "$version" != "5" ]; then
+    ui "提示: Xray Socks 出站文档存在差异，Socks4/4a 可能不被支持。"
+  fi
+
+  local users_block=""
+  if [ -n "$user" ]; then
+    users_block="\"users\":[{\"user\":\"${user}\",\"pass\":\"${pass}\"}]"
+  fi
+
+  local version_block=""
+  if [ "$version" != "5" ]; then
+    version_block="\"version\":\"${version}\""
+  fi
+
+  cat > "${OUTBOUNDS_DIR}/${tag}.json" <<EOF
+{
+  "tag": "${tag}",
+  "protocol": "socks",
+  "settings": {
+    "servers": [
+      {
+        "address": "${host}",
+        "port": ${port}$( [ -n "$users_block" ] && printf ',\n        %s' "$users_block" )
+      }
+    ]$( [ -n "$version_block" ] && printf ',\n    %s' "$version_block" )
+  }
+}
+EOF
+}
+
+build_http_outbound() {
+  local link="$1" tag="$2"
+  local scheme base qs userinfo hostport host port user pass sni alpn insecure
+
+  scheme="${link%%://*}"
+  link="${link#*://}"
+  if echo "$link" | grep -q '#'; then
+    link="${link%%#*}"
+  fi
+  if echo "$link" | grep -q '\?'; then
+    qs="${link#*\?}"
+    base="${link%%\?*}"
+  else
+    qs=""
+    base="$link"
+  fi
+
+  if echo "$base" | grep -q '@'; then
+    userinfo="${base%%@*}"
+    hostport="${base#*@}"
+  else
+    userinfo=""
+    hostport="$base"
+  fi
+
+  IFS='|' read -r host port <<< "$(parse_hostport "$hostport")"
+  if [ -z "$port" ]; then
+    if [ "$scheme" = "https" ]; then
+      port="443"
+    else
+      port="80"
+    fi
+  fi
+  [ -z "$host" ] && die "HTTP 代理缺少地址。"
+
+  if [ -n "$userinfo" ]; then
+    if echo "$userinfo" | grep -q ':'; then
+      user="${userinfo%%:*}"
+      pass="${userinfo#*:}"
+    else
+      user="$userinfo"
+      pass=""
+    fi
+    user="$(urldecode "$user")"
+    pass="$(urldecode "$pass")"
+  else
+    user=""
+    pass=""
+  fi
+
+  sni="$(urldecode "$(get_query_param sni "$qs")")"
+  alpn="$(urldecode "$(get_query_param alpn "$qs")")"
+  insecure="$(get_query_param insecure "$qs")"
+  [ -z "$insecure" ] && insecure="$(get_query_param allowInsecure "$qs")"
+
+  local users_block=""
+  if [ -n "$user" ]; then
+    users_block="\"users\":[{\"user\":\"${user}\",\"pass\":\"${pass}\"}]"
+  fi
+
+  local stream_block=""
+  if [ "$scheme" = "https" ]; then
+    local tls_items="\"serverName\":\"${sni:-$host}\""
+    if [ -n "$alpn" ]; then
+      tls_items="${tls_items},\"alpn\":$(json_array_from_csv "$alpn")"
+    fi
+    if [ "$insecure" = "1" ] || [ "$insecure" = "true" ]; then
+      tls_items="${tls_items},\"allowInsecure\":true"
+    fi
+    stream_block=",\n  \"streamSettings\": {\n    \"security\": \"tls\",\n    \"tlsSettings\": {\n      ${tls_items}\n    }\n  }"
+  fi
+
+  msg "提示: HTTP/HTTPS 代理仅支持 TCP，UDP 流量会被拒绝。"
+
+  cat > "${OUTBOUNDS_DIR}/${tag}.json" <<EOF
+{
+  "tag": "${tag}",
+  "protocol": "http",
+  "settings": {
+    "servers": [
+      {
+        "address": "${host}",
+        "port": ${port}$( [ -n "$users_block" ] && printf ',\n        %s' "$users_block" )
+      }
+    ]
+  }${stream_block}
+}
+EOF
+}
+
 build_outbound_from_link() {
   local link="$1" tag="$2"
   case "$link" in
@@ -878,6 +1219,9 @@ build_outbound_from_link() {
     vmess://*) build_vmess_outbound "$link" "$tag" ;;
     trojan://*) build_trojan_outbound "$link" "$tag" ;;
     ss://*) build_ss_outbound "$link" "$tag" ;;
+    hysteria2://*|hy2://*) build_hy2_outbound "$link" "$tag" ;;
+    socks://*|socks4://*|socks4a://*|socks5://*) build_socks_outbound "$link" "$tag" ;;
+    http://*|https://*) build_http_outbound "$link" "$tag" ;;
     *) die "不支持的链接协议。" ;;
   esac
 }
@@ -1045,7 +1389,7 @@ add_custom_outbound() {
     fi
     break
   done
-  read -r -p "请输入出口链接(VLESS/VMess/Trojan/SS): " link
+  read -r -p "请输入出口链接(VLESS/VMess/Trojan/SS/HY2/SOCKS/HTTP/HTTPS): " link
   build_outbound_from_link "$link" "$tag"
   save_outbound_link "$tag" "$link"
   echo "$tag"
@@ -1057,8 +1401,10 @@ add_custom_outbound_only() {
   if [ -s "$INBOUNDS_FILE" ]; then
     build_config
     restart_xray
+    test_outbound "$tag"
     msg "自定义出口已添加: ${tag}"
   else
+    test_outbound "$tag"
     msg "自定义出口已添加: ${tag} (当前无入口，未重启)"
   fi
 }
@@ -1077,6 +1423,7 @@ update_custom_outbound() {
     build_config
     restart_xray
   fi
+  test_outbound "$tag"
   msg "自定义出口已更新: ${tag}"
 }
 
@@ -1194,6 +1541,7 @@ add_inbound() {
   echo "${tag}|${port}|${out_tag}|${remark}" >> "$INBOUNDS_FILE"
   build_config
   restart_xray
+  test_outbound "$out_tag"
   msg "入口已添加。"
 }
 
@@ -1297,6 +1645,7 @@ change_outbound() {
   update_inbound_line "$idx" "" "$new_out"
   build_config
   restart_xray
+  test_outbound "$new_out"
   msg "出口已更新。"
 }
 
