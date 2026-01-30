@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# 适用系统: Debian 11~13 / Alpine（Alpine 需先安装 bash: apk add bash）
+# 适用系统: Debian 11~13 / Ubuntu 20.04~24.04 / Alpine（Alpine 需先安装 bash: apk add bash）
 # 适用架构: x86/x64/arm64/arm32
+# 适用环境: 物理机 / KVM / LXC / Docker（容器场景会使用保守的加速参数）
 # 功能概述: sing-box + Reality 一键部署/管理，支持多入口与多出口
+# DNS 说明: 内置 DNS，默认优先 IPv4；IPv6-only 会自动切换；DNS 可随出口分流
 set -euo pipefail
 
 SB_BIN="/usr/local/bin/sing-box"
@@ -20,7 +22,7 @@ SB_UNPACK_DIR="${TMP_DIR}/sing-box_unpack"
 WGCF_BIN="${TMP_DIR}/wgcf"
 WGCF_DST="/usr/local/bin/wgcf"
 WGCF_DIR="${TMP_DIR}/wgcf_work"
-DEFAULT_SNI="www.microsoft.com"
+DEFAULT_SNI="www.apple.com"
 
 C_RESET=""
 C_BOLD=""
@@ -43,6 +45,17 @@ die() { err "$*"; exit 1; }
 cmd_exists() { command -v "$1" >/dev/null 2>&1; }
 systemd_available() { cmd_exists systemctl && [ -d /run/systemd/system ]; }
 openrc_available() { cmd_exists rc-service && [ -d /etc/init.d ]; }
+ipv6_only() {
+  if cmd_exists ip; then
+    if ip -4 addr show scope global 2>/dev/null | grep -q "inet "; then
+      return 1
+    fi
+    if ip -6 addr show scope global 2>/dev/null | grep -q "inet6 "; then
+      return 0
+    fi
+  fi
+  return 1
+}
 
 ensure_bash() {
   if [ -z "${BASH_VERSION:-}" ]; then
@@ -70,7 +83,7 @@ menu_item() { msg "  ${C_YELLOW}$1)${C_RESET} $2"; }
 
 check_os() {
   if [ ! -r /etc/os-release ]; then
-    die "无法识别系统版本，仅支持 Debian 11~13/Alpine。"
+    die "无法识别系统版本，仅支持 Debian 11~13/Ubuntu 20.04~24.04/Alpine。"
   fi
   # shellcheck source=/etc/os-release
   . /etc/os-release
@@ -80,19 +93,30 @@ check_os() {
     OS_VERSION="${VERSION_ID:-unknown}"
     return 0
   fi
-  if [ "$OS_ID" != "debian" ]; then
-    die "仅支持 Debian 11~13/Alpine。"
+  if [ "$OS_ID" != "debian" ] && [ "$OS_ID" != "ubuntu" ]; then
+    die "仅支持 Debian 11~13/Ubuntu 20.04~24.04/Alpine。"
   fi
   local major
   major="$(echo "${VERSION_ID:-}" | awk -F. '{print $1}')"
   if ! echo "$major" | grep -qE '^[0-9]+$'; then
+    if [ "$OS_ID" = "ubuntu" ]; then
+      die "无法识别 Ubuntu 版本，仅支持 Ubuntu 20.04~24.04。"
+    fi
     die "无法识别 Debian 版本，仅支持 Debian 11~13。"
   fi
-  if [ "$major" -lt 11 ] || [ "$major" -gt 13 ]; then
-    die "仅支持 Debian 11~13 (当前: ${VERSION_ID:-unknown})。"
+  if [ "$OS_ID" = "ubuntu" ]; then
+    if [ "$major" -lt 20 ] || [ "$major" -gt 24 ]; then
+      die "仅支持 Ubuntu 20.04~24.04 (当前: ${VERSION_ID:-unknown})。"
+    fi
+    OS_NAME="Ubuntu"
+    OS_VERSION="${VERSION_ID:-20.04-24.04}"
+  else
+    if [ "$major" -lt 11 ] || [ "$major" -gt 13 ]; then
+      die "仅支持 Debian 11~13 (当前: ${VERSION_ID:-unknown})。"
+    fi
+    OS_NAME="Debian"
+    OS_VERSION="${VERSION_ID:-11-13}"
   fi
-  OS_NAME="Debian"
-  OS_VERSION="${VERSION_ID:-11-13}"
 }
 
 is_alpine() {
@@ -300,6 +324,18 @@ restart_singbox() {
   else
     stop_singbox
     start_singbox
+  fi
+}
+
+restart_singbox_with_check() {
+  local port="$1"
+  restart_singbox
+  if [ -n "$port" ] && ! wait_port_listen "$port"; then
+    ui "检测到端口未监听，尝试再次重启 sing-box..."
+    restart_singbox
+    if ! wait_port_listen "$port"; then
+      ui "重启后端口仍未监听，请检查服务状态/日志/防火墙。"
+    fi
   fi
 }
 
@@ -1510,7 +1546,7 @@ add_inbound() {
   tag="$(next_inbound_tag)"
   echo "${tag}|${port}|${out_tag}|${remark}" >> "$INBOUNDS_FILE"
   build_config
-  restart_singbox
+  restart_singbox_with_check "$port"
   test_outbound "$out_tag"
   msg "入口已添加。"
 }
@@ -1604,7 +1640,7 @@ change_port() {
   new_port="$(prompt_port)"
   update_inbound_line "$idx" "$new_port" ""
   build_config
-  restart_singbox
+  restart_singbox_with_check "$new_port"
   msg "端口已更新。"
 }
 
@@ -1642,9 +1678,18 @@ build_config() {
     die "未配置任何入口。"
   fi
 
-  local tmp dest_host dest_port
+  local tmp dest_host dest_port dns_strategy dns_final
+  dns_strategy="prefer_ipv4"
+  dns_final="dns_direct4_1"
+  if ipv6_only; then
+    dns_strategy="prefer_ipv6"
+    dns_final="dns_direct6_1"
+  fi
   tmp="$(tmp_path config.json)"
   IFS='|' read -r dest_host dest_port <<< "$(split_host_port "$DEST")"
+
+  local used_outbounds
+  used_outbounds="$(awk -F'|' 'NF>=3{print $3}' "$INBOUNDS_FILE" | awk '!seen[$0]++')"
 
   local inbound_count=0 outbound_count=0 endpoint_count=0 rule_count=0
   {
@@ -1655,14 +1700,31 @@ build_config() {
     echo '  },'
     echo '  "dns": {'
     echo '    "servers": ['
-    echo '      { "tag": "dns_direct4_1", "address": "1.1.1.1", "detour": "direct4" },'
-    echo '      { "tag": "dns_direct4_2", "address": "8.8.8.8", "detour": "direct4" },'
-    echo '      { "tag": "dns_direct4_3", "address": "223.5.5.5", "detour": "direct4" },'
-    echo '      { "tag": "dns_direct6_1", "address": "2606:4700:4700::1111", "detour": "direct6" },'
-    echo '      { "tag": "dns_direct6_2", "address": "2001:4860:4860::8888", "detour": "direct6" }'
+    echo '      { "tag": "dns_direct4_1", "address": "https://1.1.1.1/dns-query", "detour": "direct4" },'
+    echo '      { "tag": "dns_direct4_2", "address": "https://8.8.8.8/dns-query", "detour": "direct4" },'
+    echo '      { "tag": "dns_direct4_3", "address": "https://223.5.5.5/dns-query", "detour": "direct4" },'
+    echo '      { "tag": "dns_direct6_1", "address": "https://[2606:4700:4700::1111]/dns-query", "detour": "direct6" },'
+    echo '      { "tag": "dns_direct6_2", "address": "https://[2001:4860:4860::8888]/dns-query", "detour": "direct6" }'
+    if [ -n "$used_outbounds" ]; then
+      while IFS= read -r out_tag; do
+        [ -z "$out_tag" ] && continue
+        echo "      ,{ \"tag\": \"dns_out_${out_tag}\", \"address\": \"https://1.1.1.1/dns-query\", \"detour\": \"${out_tag}\" }"
+      done <<< "$used_outbounds"
+    fi
     echo '    ],'
-    echo '    "final": "dns_direct4_1",'
-    echo '    "strategy": "prefer_ipv4"'
+    echo '    "rules": ['
+    local dns_rule_count=0
+    while IFS='|' read -r tag port out remark; do
+      [ -z "$tag" ] && continue
+      if [ "$dns_rule_count" -gt 0 ]; then
+        echo '      ,'
+      fi
+      dns_rule_count=$((dns_rule_count+1))
+      echo "      { \"inbound\": [\"$(json_escape "$tag")\"], \"server\": \"dns_out_${out}\" }"
+    done < "$INBOUNDS_FILE"
+    echo '    ],'
+    echo "    \"final\": \"${dns_final}\","
+    echo "    \"strategy\": \"${dns_strategy}\""
     echo '  },'
     echo '  "inbounds": ['
     while IFS='|' read -r tag port out remark; do

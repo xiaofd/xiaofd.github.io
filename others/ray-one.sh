@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# 适用系统: Debian 11~13 / Alpine（Alpine 需先安装 bash: apk add bash）
+# 适用系统: Debian 11~13 / Ubuntu 20.04~24.04 / Alpine（Alpine 需先安装 bash: apk add bash）
 # 适用架构: x86/x64/arm64/arm32
+# 适用环境: 物理机 / KVM / LXC / Docker（容器场景会使用保守的加速参数）
 # 功能概述: Xray Reality 一键部署/管理，支持多入口与多出口
+# DNS 说明: 内置 DNS（DoH），默认优先 IPv4；IPv6-only 会自动切换；强制参与解析
 set -euo pipefail
 
 XRAY_BIN="/usr/local/bin/xray"
@@ -19,7 +21,7 @@ XRAY_UNPACK_DIR="${TMP_DIR}/xray_unpack"
 WGCF_BIN="${TMP_DIR}/wgcf"
 WGCF_DST="/usr/local/bin/wgcf"
 WGCF_DIR="${TMP_DIR}/wgcf_work"
-DEFAULT_SNI="www.microsoft.com"
+DEFAULT_SNI="www.apple.com"
 
 C_RESET=""
 C_BOLD=""
@@ -42,6 +44,17 @@ die() { err "$*"; exit 1; }
 cmd_exists() { command -v "$1" >/dev/null 2>&1; }
 systemd_available() { cmd_exists systemctl && [ -d /run/systemd/system ]; }
 openrc_available() { cmd_exists rc-service && [ -d /etc/init.d ]; }
+ipv6_only() {
+  if cmd_exists ip; then
+    if ip -4 addr show scope global 2>/dev/null | grep -q "inet "; then
+      return 1
+    fi
+    if ip -6 addr show scope global 2>/dev/null | grep -q "inet6 "; then
+      return 0
+    fi
+  fi
+  return 1
+}
 
 ensure_bash() {
   if [ -z "${BASH_VERSION:-}" ]; then
@@ -69,7 +82,7 @@ menu_item() { msg "  ${C_YELLOW}$1)${C_RESET} $2"; }
 
 check_os() {
   if [ ! -r /etc/os-release ]; then
-    die "无法识别系统版本，仅支持 Debian 11~13/Alpine。"
+    die "无法识别系统版本，仅支持 Debian 11~13/Ubuntu 20.04~24.04/Alpine。"
   fi
   # shellcheck source=/etc/os-release
   . /etc/os-release
@@ -79,19 +92,30 @@ check_os() {
     OS_VERSION="${VERSION_ID:-unknown}"
     return 0
   fi
-  if [ "$OS_ID" != "debian" ]; then
-    die "仅支持 Debian 11~13/Alpine。"
+  if [ "$OS_ID" != "debian" ] && [ "$OS_ID" != "ubuntu" ]; then
+    die "仅支持 Debian 11~13/Ubuntu 20.04~24.04/Alpine。"
   fi
   local major
   major="$(echo "${VERSION_ID:-}" | awk -F. '{print $1}')"
   if ! echo "$major" | grep -qE '^[0-9]+$'; then
+    if [ "$OS_ID" = "ubuntu" ]; then
+      die "无法识别 Ubuntu 版本，仅支持 Ubuntu 20.04~24.04。"
+    fi
     die "无法识别 Debian 版本，仅支持 Debian 11~13。"
   fi
-  if [ "$major" -lt 11 ] || [ "$major" -gt 13 ]; then
-    die "仅支持 Debian 11~13 (当前: ${VERSION_ID:-unknown})。"
+  if [ "$OS_ID" = "ubuntu" ]; then
+    if [ "$major" -lt 20 ] || [ "$major" -gt 24 ]; then
+      die "仅支持 Ubuntu 20.04~24.04 (当前: ${VERSION_ID:-unknown})。"
+    fi
+    OS_NAME="Ubuntu"
+    OS_VERSION="${VERSION_ID:-20.04-24.04}"
+  else
+    if [ "$major" -lt 11 ] || [ "$major" -gt 13 ]; then
+      die "仅支持 Debian 11~13 (当前: ${VERSION_ID:-unknown})。"
+    fi
+    OS_NAME="Debian"
+    OS_VERSION="${VERSION_ID:-11-13}"
   fi
-  OS_NAME="Debian"
-  OS_VERSION="${VERSION_ID:-11-13}"
 }
 
 is_alpine() {
@@ -281,6 +305,18 @@ restart_xray() {
   else
     stop_xray
     start_xray
+  fi
+}
+
+restart_xray_with_check() {
+  local port="$1"
+  restart_xray
+  if [ -n "$port" ] && ! wait_port_listen "$port"; then
+    ui "检测到端口未监听，尝试再次重启 Xray..."
+    restart_xray
+    if ! wait_port_listen "$port"; then
+      ui "重启后端口仍未监听，请检查服务状态/日志/防火墙。"
+    fi
   fi
 }
 
@@ -1540,7 +1576,7 @@ add_inbound() {
   tag="$(next_inbound_tag)"
   echo "${tag}|${port}|${out_tag}|${remark}" >> "$INBOUNDS_FILE"
   build_config
-  restart_xray
+  restart_xray_with_check "$port"
   test_outbound "$out_tag"
   msg "入口已添加。"
 }
@@ -1634,7 +1670,7 @@ change_port() {
   new_port="$(prompt_port)"
   update_inbound_line "$idx" "$new_port" ""
   build_config
-  restart_xray
+  restart_xray_with_check "$new_port"
   msg "端口已更新。"
 }
 
@@ -1672,7 +1708,11 @@ build_config() {
     die "未配置任何入口。"
   fi
 
-  local tmp
+  local tmp dns_query_strategy
+  dns_query_strategy="UseIPv4"
+  if ipv6_only; then
+    dns_query_strategy="UseIPv6"
+  fi
   tmp="$(tmp_path config.json)"
   local inbound_count=0 outbound_count=0 rule_count=0
   {
@@ -1684,13 +1724,13 @@ build_config() {
     echo '  },'
     echo '  "dns": {'
     echo '    "servers": ['
-    echo '      "1.1.1.1",'
-    echo '      "8.8.8.8",'
-    echo '      "223.5.5.5",'
-    echo '      "2606:4700:4700::1111",'
-    echo '      "2001:4860:4860::8888"'
+    echo '      "https://1.1.1.1/dns-query",'
+    echo '      "https://8.8.8.8/dns-query",'
+    echo '      "https://223.5.5.5/dns-query",'
+    echo '      "https://[2606:4700:4700::1111]/dns-query",'
+    echo '      "https://[2001:4860:4860::8888]/dns-query"'
     echo '    ],'
-    echo '    "queryStrategy": "UseIPv4"'
+    echo "    \"queryStrategy\": \"${dns_query_strategy}\""
     echo '  },'
     echo '  "inbounds": ['
     while IFS='|' read -r tag port out remark; do
@@ -1745,7 +1785,7 @@ EOF
     done
     echo '  ],'
     echo '  "routing": {'
-    echo '    "domainStrategy": "AsIs",'
+    echo '    "domainStrategy": "IPIfNonMatch",'
     echo '    "rules": ['
     while IFS='|' read -r tag port out remark; do
       [ -z "$tag" ] && continue
