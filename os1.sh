@@ -16,6 +16,8 @@ export ipMask=''
 export ipGate=''
 export ipDNS='8.8.8.8'
 export IncDisk='default'
+export DiskForced='0'
+export DiskReason='fallback'
 export interface=''
 export interfaceSelect=''
 export Relese=''
@@ -39,6 +41,17 @@ export VER=''
 export setCMD=''
 export setConsole=''
 export UseDHCP='0'
+export UseDHCP4='0'
+export UseDHCP6='0'
+export ForceDHCP4='0'
+export ForceStatic4='0'
+export ForceDHCP6='0'
+export ForceStatic6='0'
+export DHCP4_REASON=''
+export DHCP6_REASON=''
+export ConsoleForced='0'
+export DNSForced='0'
+export IPv6Forced='0'
 
 while [[ $# -ge 1 ]]; do
   case $1 in
@@ -99,6 +112,13 @@ while [[ $# -ge 1 ]]; do
     --ip-dns)
       shift
       ipDNS="$1"
+      DNSForced='1'
+      shift
+      ;;
+    --disk)
+      shift
+      IncDisk="$1"
+      DiskForced='1'
       shift
       ;;
     --dev-net)
@@ -129,6 +149,7 @@ while [[ $# -ge 1 ]]; do
     -console)
       shift
       setConsole="$1"
+      ConsoleForced='1'
       shift
       ;;
     -firmware)
@@ -140,16 +161,33 @@ while [[ $# -ge 1 ]]; do
       sshPORT="$1"
       shift
       ;;
+    --dhcp4)
+      shift
+      ForceDHCP4='1'
+      ;;
+    --static4)
+      shift
+      ForceStatic4='1'
+      ;;
+    --dhcp6)
+      shift
+      ForceDHCP6='1'
+      ;;
+    --static6)
+      shift
+      ForceStatic6='1'
+      ;;
     --noipv6)
       shift
       setIPv6='1'
+      IPv6Forced='1'
       ;;
     -a|--auto|-m|--manual|-ssl)
       shift
       ;;
     *)
       if [[ "$1" != 'error' ]]; then echo -ne "\nInvaild option: '$1'\n\n"; fi
-      echo -ne " Usage:\n\tbash $(basename $0)\t-d/--debian [\033[33m\033[04mdists-name\033[0m]\n\t\t\t\t-u/--ubuntu [\033[04mdists-name\033[0m]\n\t\t\t\t-c/--centos [\033[04mdists-name\033[0m]\n\t\t\t\t-v/--ver [32/i386|64/\033[33m\033[04mamd64\033[0m] [\033[33m\033[04mdists-verison\033[0m]\n\t\t\t\t--ip-addr/--ip-gate/--ip-mask\n\t\t\t\t-apt/-yum/--mirror\n\t\t\t\t-dd/--image\n\t\t\t\t-p [linux password]\n\t\t\t\t-port [linux ssh port]\n"
+      echo -ne " Usage:\n\tbash $(basename $0)\t-d/--debian [\033[33m\033[04mdists-name\033[0m]\n\t\t\t\t-u/--ubuntu [\033[04mdists-name\033[0m]\n\t\t\t\t-c/--centos [\033[04mdists-name\033[0m]\n\t\t\t\t-v/--ver [32/i386|64/\033[33m\033[04mamd64\033[0m] [\033[33m\033[04mdists-verison\033[0m]\n\t\t\t\t--ip-addr/--ip-gate/--ip-mask\n\t\t\t\t--dhcp4/--static4/--dhcp6/--static6\n\t\t\t\t--disk /dev/vda\n\t\t\t\t-apt/-yum/--mirror\n\t\t\t\t-dd/--image\n\t\t\t\t-p [linux password]\n\t\t\t\t-port [linux ssh port]\n\t\t\t\tDebian: 7-13 => wheezy/jessie/stretch/buster/bullseye/bookworm/trixie\n"
       exit 1;
       ;;
     esac
@@ -185,6 +223,169 @@ function dependence(){
     echo -ne "\n\033[31mError! \033[0mPlease use '\033[33mapt-get\033[0m' or '\033[33myum\033[0m' install it.\n\n\n"
     exit 1;
   fi
+}
+
+get_ifindex(){
+  ip -o link show dev "$interface" 2>/dev/null | awk -F': ' '{print $1}'
+}
+
+netplan_has_dhcp4(){
+  local yaml
+  yaml="$(ls -Sl /etc/netplan/*.yaml 2>/dev/null | head -n 1 | awk '{print $NF}')"
+  [ -n "$yaml" ] || return 1
+  grep -q "$interface" "$yaml" 2>/dev/null && grep -qiE 'dhcp4:\s*(true|yes)' "$yaml" 2>/dev/null
+}
+
+netplan_has_dhcp6(){
+  local yaml
+  yaml="$(ls -Sl /etc/netplan/*.yaml 2>/dev/null | head -n 1 | awk '{print $NF}')"
+  [ -n "$yaml" ] || return 1
+  grep -q "$interface" "$yaml" 2>/dev/null && grep -qiE 'dhcp6:\s*(true|yes)' "$yaml" 2>/dev/null
+}
+
+ifupdown_has_dhcp4(){
+  local f
+  for f in /etc/network/interfaces /etc/network/interfaces.d/"$interface" /etc/network/interfaces.d/*; do
+    [ -f "$f" ] || continue
+    grep -qE "iface[[:space:]]+${interface}[[:space:]]+inet[[:space:]]+dhcp" "$f" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+ifupdown_has_dhcp6(){
+  local f
+  for f in /etc/network/interfaces /etc/network/interfaces.d/"$interface" /etc/network/interfaces.d/*; do
+    [ -f "$f" ] || continue
+    grep -qE "iface[[:space:]]+${interface}[[:space:]]+inet6[[:space:]]+dhcp" "$f" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+ifcfg_has_dhcp4(){
+  local f="/etc/sysconfig/network-scripts/ifcfg-${interface}"
+  [ -f "$f" ] || return 1
+  grep -qiE 'BOOTPROTO=dhcp' "$f" 2>/dev/null
+}
+
+ifcfg_has_dhcp6(){
+  local f="/etc/sysconfig/network-scripts/ifcfg-${interface}"
+  [ -f "$f" ] || return 1
+  grep -qiE 'DHCPV6C=yes|IPV6_AUTOCONF=yes' "$f" 2>/dev/null
+}
+
+lease_has_dhcp4(){
+  local ifindex
+  ifindex="$(get_ifindex)"
+  [ -n "$ifindex" ] || return 1
+  if [ -d /run/systemd/netif/leases ]; then
+    grep -Rsq "IFINDEX=${ifindex}" /run/systemd/netif/leases 2>/dev/null && \
+      grep -Rsq "DHCP4_ADDRESS" /run/systemd/netif/leases 2>/dev/null && return 0
+  fi
+  if [ -d /var/lib/dhcp ]; then
+    grep -Rsq "interface \"${interface}\"" /var/lib/dhcp 2>/dev/null && return 0
+  fi
+  if [ -d /var/lib/dhclient ]; then
+    grep -Rsq "interface \"${interface}\"" /var/lib/dhclient 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+lease_has_dhcp6(){
+  local ifindex
+  ifindex="$(get_ifindex)"
+  [ -n "$ifindex" ] || return 1
+  if [ -d /run/systemd/netif/leases ]; then
+    grep -Rsq "IFINDEX=${ifindex}" /run/systemd/netif/leases 2>/dev/null && \
+      grep -Rsq "DHCP6" /run/systemd/netif/leases 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+detect_dhcp_v4(){
+  if [[ "$ForceDHCP4" == '1' ]]; then
+    UseDHCP4='1'
+    DHCP4_REASON="forced"
+    return 0
+  fi
+  if [[ "$ForceStatic4" == '1' ]]; then
+    UseDHCP4='0'
+    DHCP4_REASON="forced"
+    return 0
+  fi
+  if [[ "$setNet" == '1' ]]; then
+    UseDHCP4='0'
+    DHCP4_REASON="static"
+    return 0
+  fi
+  if ip -4 addr show dev "$interface" 2>/dev/null | grep -q 'dynamic'; then
+    UseDHCP4='1'
+    DHCP4_REASON="dynamic"
+    return 0
+  fi
+  if ip route show default dev "$interface" 2>/dev/null | grep -q 'proto dhcp'; then
+    UseDHCP4='1'
+    DHCP4_REASON="route"
+    return 0
+  fi
+  if lease_has_dhcp4; then
+    UseDHCP4='1'
+    DHCP4_REASON="lease"
+    return 0
+  fi
+  if netplan_has_dhcp4 || ifupdown_has_dhcp4 || ifcfg_has_dhcp4; then
+    UseDHCP4='1'
+    DHCP4_REASON="config"
+    return 0
+  fi
+  if command -v nmcli >/dev/null 2>&1; then
+    nmcli -g IP4.DHCP4.OPTION dev show "$interface" 2>/dev/null | grep -q . && {
+      UseDHCP4='1'
+      DHCP4_REASON="nmcli"
+      return 0
+    }
+  fi
+  if [[ -z "$ipAddr" ]] || [[ -z "$ipGate" ]]; then
+    UseDHCP4='1'
+    DHCP4_REASON="fallback"
+    return 0
+  fi
+  UseDHCP4='0'
+  DHCP4_REASON="static"
+}
+
+detect_auto_v6(){
+  if [[ "$setIPv6" == '1' ]]; then
+    UseDHCP6='0'
+    DHCP6_REASON="disabled"
+    return 0
+  fi
+  if [[ "$ForceDHCP6" == '1' ]]; then
+    UseDHCP6='1'
+    DHCP6_REASON="forced"
+    return 0
+  fi
+  if [[ "$ForceStatic6" == '1' ]]; then
+    UseDHCP6='0'
+    DHCP6_REASON="forced"
+    return 0
+  fi
+  if netplan_has_dhcp6 || ifupdown_has_dhcp6 || ifcfg_has_dhcp6; then
+    UseDHCP6='1'
+    DHCP6_REASON="config"
+    return 0
+  fi
+  if lease_has_dhcp6; then
+    UseDHCP6='1'
+    DHCP6_REASON="lease"
+    return 0
+  fi
+  if ip -6 addr show dev "$interface" scope global 2>/dev/null | grep -q 'dynamic'; then
+    UseDHCP6='1'
+    DHCP6_REASON="dynamic"
+    return 0
+  fi
+  UseDHCP6='0'
+  DHCP6_REASON="static"
 }
 
 function selectMirror(){
@@ -250,8 +451,32 @@ function getDisk(){
   [ $? -eq 0 ] && echo "$disks" || echo "/dev/$disks"
 }
 
+function getRootDisk(){
+  local src disk
+  src="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+  [ -z "$src" ] && src="$(mount | awk '$3=="/"{print $1; exit}')"
+  [ -z "$src" ] && return 1
+  if echo "$src" | grep -q "^/dev/"; then
+    if command -v lsblk >/dev/null 2>&1; then
+      disk="$(lsblk -no PKNAME "$src" 2>/dev/null | head -n1)"
+      [ -n "$disk" ] && { echo "/dev/$disk"; return 0; }
+    fi
+    echo "$src" | sed -E 's|^(/dev/[a-zA-Z]+)[0-9].*|\1|; s|^(/dev/nvme[0-9]+n[0-9]+)p[0-9]+.*|\1|'
+    return 0
+  fi
+  return 1
+}
+
 function diskType(){
   echo `udevadm info --query all "$1" 2>/dev/null |grep 'ID_PART_TABLE_TYPE' |cut -d'=' -f2`
+}
+
+function diskSizeBytes(){
+  lsblk -b -dn -o SIZE "$1" 2>/dev/null | head -n1
+}
+
+function efiEnabled(){
+  [ -d /sys/firmware/efi ]
 }
 
 function getGrub(){
@@ -306,10 +531,7 @@ if [ "$setNet" == "0" ]; then
     ipMask=`netmask $(echo ${iAddr} |cut -d'/' -f2)`
     ipGate=`ip route show default |grep "^default" |grep -o '[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}' |head -n1`
   fi
-  ip route show default dev "$interface" 2>/dev/null |grep -q 'proto dhcp' && UseDHCP='1'
-  if [[ -z "$ipAddr" ]] || [[ -z "$ipGate" ]]; then
-    UseDHCP='1'
-  fi
+  detect_dhcp_v4
 fi
 if [ -z "$interface" ]; then
     dependence ip
@@ -319,9 +541,11 @@ HasIPv6='0'
 if [[ "$setIPv6" == '0' ]] && [[ -n "$interface" ]]; then
   ip -6 addr show dev "$interface" scope global |grep -q 'inet6' && HasIPv6='1'
 fi
+detect_auto_v6
+UseDHCP="$UseDHCP4"
 IPv4="$ipAddr"; MASK="$ipMask"; GATE="$ipGate";
 
-if [[ "$UseDHCP" == '0' ]]; then
+if [[ "$UseDHCP4" == '0' ]]; then
   [ -n "$IPv4" ] && [ -n "$MASK" ] && [ -n "$GATE" ] && [ -n "$ipDNS" ] || {
   echo -ne '\nError: Invalid network config\n\n'
   bash $0 error;
@@ -338,7 +562,21 @@ fi
 [[ -n "$tmpWORD" ]] && myPASSWORD="$(openssl passwd -1 "$tmpWORD")";
 [[ -z "$myPASSWORD" ]] && myPASSWORD='$1$4BJZaD0A$y1QykUnJ6mXprENfwpseH0';
 
-tempDisk=`getDisk`; [ -n "$tempDisk" ] && IncDisk="$tempDisk"
+if [[ "$DiskForced" != "1" || "$IncDisk" == "default" ]]; then
+  tempDisk="$(getRootDisk)"
+  if [ -n "$tempDisk" ]; then
+    IncDisk="$tempDisk"
+    DiskReason="root"
+  else
+    tempDisk="$(getDisk)"
+    if [ -n "$tempDisk" ]; then
+      IncDisk="$tempDisk"
+      DiskReason="fallback"
+    fi
+  fi
+else
+  DiskReason="forced"
+fi
 
 case `uname -m` in aarch64|arm64) VER="arm64";; x86|i386|i686) VER="i386";; x86_64|amd64) VER="amd64";; *) VER="";; esac
 tmpVER="$(echo "$tmpVER" |sed -r 's/(.*)/\L\1/')";
@@ -358,6 +596,14 @@ if [[ -z "$tmpDIST" ]]; then
   [ "$Relese" == 'CentOS' ] && tmpDIST='6.10';
 fi
 
+if [ -z "$setConsole" ]; then
+  if [ -c /dev/ttyAMA0 ]; then
+    setConsole="tty1 console=ttyAMA0,115200n8"
+  elif [ -c /dev/ttyS0 ]; then
+    setConsole="tty1 console=ttyS0,115200n8"
+  fi
+fi
+
 if [[ -n "$tmpDIST" ]]; then
   if [[ "$Relese" == 'Debian' ]]; then
     SpikCheckDIST='0'
@@ -372,6 +618,7 @@ if [[ -n "$tmpDIST" ]]; then
         [[ "$isDigital" == '10' ]] && DIST='buster';
         [[ "$isDigital" == '11' ]] && DIST='bullseye';
         [[ "$isDigital" == '12' ]] && DIST='bookworm';
+        [[ "$isDigital" == '13' ]] && DIST='trixie';
       }
     }
     LinuxMirror=$(selectMirror "$Relese" "$DIST" "$VER" "$tmpMirror")
@@ -454,30 +701,87 @@ if [[ "$ddMode" == '1' ]]; then
   fi
 fi
 
-echo -e "\n\033[36m# Confirm Config\033[0m\n"
+if [ -t 1 ]; then
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_CYAN=$'\033[36m'
+  C_RESET=$'\033[0m'
+else
+  C_GREEN=""
+  C_YELLOW=""
+  C_CYAN=""
+  C_RESET=""
+fi
+
+iface_color="$C_YELLOW"
+[ -n "$interface" ] && iface_color="$C_GREEN"
+
+disk_color="$C_YELLOW"
+if [ -b "$IncDisk" ]; then
+  if [[ "$DiskReason" == "forced" || "$DiskReason" == "root" ]]; then
+    disk_color="$C_GREEN"
+  else
+    disk_color="$C_YELLOW"
+  fi
+fi
+
+dns_color="$C_YELLOW"
+[[ "$DNSForced" == '1' ]] && dns_color="$C_GREEN"
+
+console_color="$C_YELLOW"
+[[ "$ConsoleForced" == '1' || -n "$setConsole" ]] && console_color="$C_GREEN"
+
+ipv4_color="$C_YELLOW"
+if [[ "$UseDHCP4" == '1' ]]; then
+  [[ "$DHCP4_REASON" != "fallback" ]] && ipv4_color="$C_GREEN"
+else
+  [[ "$DHCP4_REASON" == "static" || "$DHCP4_REASON" == "forced" ]] && ipv4_color="$C_GREEN"
+fi
+
+ipv6_color="$C_YELLOW"
+if [[ "$setIPv6" == '1' ]]; then
+  [[ "$IPv6Forced" == '1' ]] && ipv6_color="$C_GREEN"
+elif [[ "$HasIPv6" == '1' ]]; then
+  [[ "$UseDHCP6" == '1' && "$DHCP6_REASON" != "" ]] && ipv6_color="$C_GREEN"
+else
+  ipv6_color="$C_YELLOW"
+fi
+
+echo -e "\n${C_CYAN}# Confirm Config${C_RESET}\n"
 echo -e "Relese:        $Relese"
 echo -e "DIST:          $DIST"
 echo -e "VER:           $VER"
 echo -e "Mirror:        $LinuxMirror"
-echo -e "Interface:     $interface"
+echo -e "Interface:     ${iface_color}${interface:-unknown}${C_RESET}"
+echo -e "Disk:          ${disk_color}${IncDisk:-unknown}${C_RESET}"
 echo -e "SSH Port:      $sshPORT"
 echo -e "Loader Mode:   $loaderMode"
 echo -e "Add Firmware:  $IncFirmware"
-echo -e "Set Console:   $setConsole"
+echo -e "Set Console:   ${console_color}${setConsole:-default}${C_RESET}"
 echo -e "Set CMD:       $setCMD"
 echo -e "IPv6 Disable:  $setIPv6"
 echo -e "DevNet Name:   $setInterfaceName"
 echo -e "RDP:           $setRDP"
 echo -e "RDP Port:      $WinRemote"
-if [[ "$UseDHCP" == '1' ]]; then
-  echo -e "Network:       DHCP"
+if [[ "$UseDHCP4" == '1' ]]; then
+  echo -e "IPv4:          ${ipv4_color}DHCP${C_RESET}"
 else
-  echo -e "IPv4:          $IPv4"
-  echo -e "Mask:          $MASK"
-  echo -e "Gateway:       $GATE"
-  echo -e "DNS:           $ipDNS"
+  echo -e "IPv4:          ${ipv4_color}${IPv4}${C_RESET}"
+  echo -e "Mask:          ${ipv4_color}${MASK}${C_RESET}"
+  echo -e "Gateway:       ${ipv4_color}${GATE}${C_RESET}"
+  echo -e "DNS:           ${dns_color}${ipDNS}${C_RESET}"
 fi
-[[ "$HasIPv6" == '1' ]] && echo -e "IPv6:          detected"
+if [[ "$setIPv6" == '1' ]]; then
+  echo -e "IPv6:          ${ipv6_color}disabled${C_RESET}"
+elif [[ "$HasIPv6" == '1' ]]; then
+  if [[ "$UseDHCP6" == '1' ]]; then
+    echo -e "IPv6:          ${ipv6_color}auto${C_RESET}"
+  else
+    echo -e "IPv6:          ${ipv6_color}detected${C_RESET}"
+  fi
+else
+  echo -e "IPv6:          ${ipv6_color}none${C_RESET}"
+fi
 [[ "$ddMode" == '1' ]] && echo -e "DD Image:      $DDURL"
 read -r -p "Continue install? [y/N]: " confirm_install
 case "$confirm_install" in
@@ -673,6 +977,22 @@ d-i keyboard-configuration/xkb-keymap string us
 
 d-i netcfg/choose_interface select $interfaceSelect
 
+EOF
+  gptPartitionPreseed=""
+  if efiEnabled; then
+    gptPartitionPreseed=$(echo -e "d-i partman-basicfilesystems/choose_label string gpt\nd-i partman-basicfilesystems/default_label string gpt\nd-i partman-partitioning/choose_label string gpt\nd-i partman-partitioning/default_label string gpt\nd-i partman/choose_label string gpt\nd-i partman/default_label string gpt")
+  else
+    disk_table="$(diskType "$IncDisk")"
+    disk_size="$(diskSizeBytes "$IncDisk")"
+    if [[ "$disk_table" == "gpt" ]] || { [[ -n "$disk_size" ]] && [[ "$disk_size" -ge "2199023255552" ]]; }; then
+      gptPartitionPreseed=$(echo -e "d-i partman-basicfilesystems/choose_label string gpt\nd-i partman-basicfilesystems/default_label string gpt\nd-i partman-partitioning/choose_label string gpt\nd-i partman-partitioning/default_label string gpt\nd-i partman/choose_label string gpt\nd-i partman/default_label string gpt")
+    fi
+  fi
+  if [ -n "$gptPartitionPreseed" ]; then
+    echo "$gptPartitionPreseed" >>/tmp/boot/preseed.cfg
+  fi
+cat >>/tmp/boot/preseed.cfg<<EOF
+
 d-i netcfg/disable_autoconfig boolean true
 d-i netcfg/dhcp_failed note
 d-i netcfg/dhcp_options select Configure network manually
@@ -702,8 +1022,8 @@ d-i clock-setup/ntp boolean false
 
 d-i preseed/early_command string anna-install libfuse2-udeb fuse-udeb ntfs-3g-udeb libcrypto1.1-udeb libpcre2-8-0-udeb libssl1.1-udeb libuuid1-udeb zlib1g-udeb wget-udeb
 d-i partman/early_command string [[ -n "\$(blkid -t TYPE='vfat' -o device)" ]] && umount "\$(blkid -t TYPE='vfat' -o device)"; \
-debconf-set partman-auto/disk "\$(list-devices disk |head -n1)"; \
-wget -qO- '$DDURL' | $DEC_CMD |/bin/dd of=\$(list-devices disk |head -n1); \
+debconf-set partman-auto/disk "${IncDisk}";
+wget -qO- '$DDURL' | $DEC_CMD |/bin/dd of=${IncDisk}; \
 mount.ntfs-3g \$(list-devices partition |head -n1) /mnt; \
 cd '/mnt/ProgramData/Microsoft/Windows/Start Menu/Programs'; \
 cd Start* || cd start*; \
@@ -760,7 +1080,7 @@ echo '${setCMD}' >>/target/etc/run.sh; \
 echo 'exit 0' >>/target/etc/run.sh; 
 EOF
 
-if [[ "$UseDHCP" == '1' ]]; then
+if [[ "$UseDHCP4" == '1' ]]; then
   sed -i '/netcfg\/disable_autoconfig/d' /tmp/boot/preseed.cfg
   sed -i '/netcfg\/dhcp_options/d' /tmp/boot/preseed.cfg
   sed -i '/netcfg\/get_.*/d' /tmp/boot/preseed.cfg
@@ -786,7 +1106,7 @@ WinRDP(){
 }
   echo -ne "\0100ECHO\0040OFF\r\n\r\ncd\0056\0076\0045WINDIR\0045\0134GetAdmin\r\nif\0040exist\0040\0045WINDIR\0045\0134GetAdmin\0040\0050del\0040\0057f\0040\0057q\0040\0042\0045WINDIR\0045\0134GetAdmin\0042\0051\0040else\0040\0050\r\necho\0040CreateObject\0136\0050\0042Shell\0056Application\0042\0136\0051\0056ShellExecute\0040\0042\0045\0176s0\0042\0054\0040\0042\0045\0052\0042\0054\0040\0042\0042\0054\0040\0042runas\0042\0054\00401\0040\0076\0076\0040\0042\0045temp\0045\0134Admin\0056vbs\0042\r\n\0042\0045temp\0045\0134Admin\0056vbs\0042\r\ndel\0040\0057f\0040\0057q\0040\0042\0045temp\0045\0134Admin\0056vbs\0042\r\nexit\0040\0057b\00402\0051\r\n\r\n" >'/tmp/boot/net.tmp';
   [[ "$setNet" == '1' ]] && WinNoDHCP;
-  [[ "$setNet" == '0' ]] && [[ "$UseDHCP" == '0' ]] && WinNoDHCP;
+  [[ "$setNet" == '0' ]] && [[ "$UseDHCP4" == '0' ]] && WinNoDHCP;
   [[ "$setRDP" == '1' ]] && [[ -n "$WinRemote" ]] && WinRDP
   echo -ne "ECHO\0040SELECT\0040VOLUME\0075\0045\0045SystemDrive\0045\0045\0040\0076\0040\0042\0045SystemDrive\0045\0134diskpart\0056extend\0042\r\nECHO\0040EXTEND\0040\0076\0076\0040\0042\0045SystemDrive\0045\0134diskpart\0056extend\0042\r\nSTART\0040/WAIT\0040DISKPART\0040\0057S\0040\0042\0045SystemDrive\0045\0134diskpart\0056extend\0042\r\nDEL\0040\0057f\0040\0057q\0040\0042\0045SystemDrive\0045\0134diskpart\0056extend\0042\r\n\r\n" >>'/tmp/boot/net.tmp';
   echo -ne "cd\0040\0057d\0040\0042\0045ProgramData\0045\0057Microsoft\0057Windows\0057Start\0040Menu\0057Programs\0057Startup\0042\r\ndel\0040\0057f\0040\0057q\0040net\0056bat\r\n\r\n\r\n" >>'/tmp/boot/net.tmp';
@@ -800,11 +1120,13 @@ WinRDP(){
 }
 
 elif [[ "$linux_relese" == 'centos' ]]; then
-if [[ "$UseDHCP" == '1' ]]; then
+if [[ "$UseDHCP4" == '1' ]]; then
   KS_NETWORK_LINE="network --bootproto=dhcp --onboot=on"
-  [[ "$HasIPv6" == '1' ]] && KS_NETWORK_LINE="${KS_NETWORK_LINE} --ipv6=auto"
 else
   KS_NETWORK_LINE="network --bootproto=static --ip=$IPv4 --netmask=$MASK --gateway=$GATE --nameserver=$ipDNS --onboot=on"
+fi
+if [[ "$HasIPv6" == '1' ]] && [[ "$UseDHCP6" == '1' ]]; then
+  KS_NETWORK_LINE="${KS_NETWORK_LINE} --ipv6=auto"
 fi
 cat >/tmp/boot/ks.cfg<<EOF
 #platform=x86, AMD64, or Intel EM64T
