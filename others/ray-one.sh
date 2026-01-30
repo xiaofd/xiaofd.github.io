@@ -1682,6 +1682,16 @@ build_config() {
     echo '    "access": "/var/log/xray/access.log",'
     echo '    "error": "/var/log/xray/error.log"'
     echo '  },'
+    echo '  "dns": {'
+    echo '    "servers": ['
+    echo '      "1.1.1.1",'
+    echo '      "8.8.8.8",'
+    echo '      "223.5.5.5",'
+    echo '      "2606:4700:4700::1111",'
+    echo '      "2001:4860:4860::8888"'
+    echo '    ],'
+    echo '    "queryStrategy": "UseIPv4"'
+    echo '  },'
     echo '  "inbounds": ['
     while IFS='|' read -r tag port out remark; do
       [ -z "$tag" ] && continue

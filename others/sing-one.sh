@@ -1653,6 +1653,17 @@ build_config() {
     echo '    "level": "warn",'
     echo '    "output": "/var/log/sing-box/sing-box.log"'
     echo '  },'
+    echo '  "dns": {'
+    echo '    "servers": ['
+    echo '      { "tag": "dns_direct4_1", "address": "1.1.1.1", "detour": "direct4" },'
+    echo '      { "tag": "dns_direct4_2", "address": "8.8.8.8", "detour": "direct4" },'
+    echo '      { "tag": "dns_direct4_3", "address": "223.5.5.5", "detour": "direct4" },'
+    echo '      { "tag": "dns_direct6_1", "address": "2606:4700:4700::1111", "detour": "direct6" },'
+    echo '      { "tag": "dns_direct6_2", "address": "2001:4860:4860::8888", "detour": "direct6" }'
+    echo '    ],'
+    echo '    "final": "dns_direct4_1",'
+    echo '    "strategy": "prefer_ipv4"'
+    echo '  },'
     echo '  "inbounds": ['
     while IFS='|' read -r tag port out remark; do
       [ -z "$tag" ] && continue
