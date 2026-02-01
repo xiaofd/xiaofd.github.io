@@ -25,6 +25,9 @@ WGCF_BIN="${TMP_DIR}/wgcf"
 WGCF_DST="/usr/local/bin/wgcf"
 WGCF_DIR="${TMP_DIR}/wgcf_work"
 DEFAULT_SNI="www.apple.com"
+HY2_CERT_MODE="self"
+HY2_DOMAIN=""
+AUTO_PROTO=""
 
 C_RESET=""
 C_BOLD=""
@@ -298,8 +301,9 @@ start_singbox() {
     rc-update add sing-box default >/dev/null 2>&1 || true
     rc-service sing-box start
   else
+    mkdir -p "$(dirname "$PID_FILE")" 2>/dev/null || true
     nohup "$SB_BIN" run -c "${CONFIG_DIR}/config.json" >/var/log/sing-box/sing-box.log 2>&1 &
-    echo $! > "$PID_FILE"
+    echo $! > "$PID_FILE" 2>/dev/null || true
   fi
 }
 
@@ -337,6 +341,7 @@ restart_singbox_with_check() {
     restart_singbox
     if ! wait_port_listen "$port"; then
       ui "重启后端口仍未监听，请检查服务状态/日志/防火墙。"
+      diagnose_start_failure
     fi
   fi
 }
@@ -399,6 +404,14 @@ gen_reality_keys() {
   fi
 }
 
+gen_hy2_password() {
+  if cmd_exists openssl; then
+    openssl rand -base64 18 | tr -d '\n'
+  else
+    dd if=/dev/urandom bs=18 count=1 2>/dev/null | base64 | tr -d '\n'
+  fi
+}
+
 split_host_port() {
   local in="$1" host port
   IFS='|' read -r host port <<< "$(parse_hostport "$in")"
@@ -416,8 +429,8 @@ SERVER_NAME=${SERVER_NAME}
 DEST=${DEST}
 FINGERPRINT=${FINGERPRINT}
 SHARE_HOST=${SHARE_HOST}
-HY2_CERT_MODE=${HY2_CERT_MODE}
-HY2_DOMAIN=${HY2_DOMAIN}
+HY2_CERT_MODE=${HY2_CERT_MODE:-self}
+HY2_DOMAIN=${HY2_DOMAIN:-}
 EOF
 }
 
@@ -428,6 +441,9 @@ load_manager_conf() {
   # shellcheck source=/etc/sing-box/manager.conf
   . "$MANAGER_CONF"
   [ -z "${HY2_CERT_MODE:-}" ] && HY2_CERT_MODE="self"
+  [ -z "${SERVER_NAME:-}" ] && SERVER_NAME="${DEFAULT_SNI}"
+  [ -z "${DEST:-}" ] && DEST="${SERVER_NAME}:443"
+  return 0
 }
 
 ensure_direct_outbounds() {
@@ -464,16 +480,14 @@ ensure_hy2_cert() {
 }
 
 issue_hy2_acme_cert() {
-  local domain token account_id ip_choice ip_addr
+  local domain token ip_choice ip_addr
   domain="${HY2_DOMAIN:-}"
   if [ -z "$domain" ]; then
     read -r -p "HY2 证书域名(需解析到本机): " domain
   fi
   [ -z "$domain" ] && die "域名不能为空。"
   read -r -p "Cloudflare Token (DNS): " token
-  read -r -p "Cloudflare Account ID: " account_id
   [ -z "$token" ] && die "CF Token 不能为空。"
-  [ -z "$account_id" ] && die "CF Account ID 不能为空。"
 
   ui "${C_BOLD}${C_BLUE}解析类型：${C_RESET}"
   ui "  ${C_YELLOW}1)${C_RESET} IPv4 (A 记录，默认)"
@@ -497,8 +511,8 @@ issue_hy2_acme_cert() {
     curl -fsSL https://get.acme.sh | sh
   fi
   export CF_Token="$token"
-  export CF_Account_ID="$account_id"
   /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$domain" --keylength 2048 || die "申请证书失败。"
+  unset CF_Token
   /root/.acme.sh/acme.sh --install-cert -d "$domain" \
     --key-file "$HY2_KEY" \
     --fullchain-file "$HY2_CERT" || die "安装证书失败。"
@@ -1653,49 +1667,78 @@ next_inbound_tag() {
 
 add_inbound() {
   local port out_tag tag remark proto hy2_pass up down choice
+  hy2_pass=""
+  up=""
+  down=""
   port="$(prompt_port)"
   out_tag="$(choose_outbound)"
   if ! echo "$out_tag" | grep -qE '^[A-Za-z0-9_]+$'; then
     die "出口选择异常，请重试。"
   fi
-  ui "${C_BOLD}${C_BLUE}入口协议：${C_RESET}"
-  ui "  ${C_YELLOW}1)${C_RESET} VLESS Reality (TCP)"
-  ui "  ${C_YELLOW}2)${C_RESET} Hysteria2 (HY2)"
-  read -r -p "请选择 [1-2]: " proto
-  case "$proto" in
-    2)
-      proto="hy2"
-      load_manager_conf
-      ui "${C_BOLD}${C_BLUE}HY2 证书类型：${C_RESET}"
-      ui "  ${C_YELLOW}1)${C_RESET} 自签证书(需 insecure)"
-      ui "  ${C_YELLOW}2)${C_RESET} 自动申请证书(Cloudflare DNS API)"
-      read -r -p "请选择 [1-2]: " choice
-      case "$choice" in
-        2)
-          HY2_CERT_MODE="acme"
-          read -r -p "HY2 域名(需解析到本机): " HY2_DOMAIN
-          ;;
-        *)
-          HY2_CERT_MODE="self"
-          ;;
-      esac
-      save_manager_conf
-      read -r -p "HY2 密码: " hy2_pass
-      [ -z "$hy2_pass" ] && die "HY2 密码不能为空。"
-      read -r -p "HY2 上行带宽(Mbps，可留空): " up
-      read -r -p "HY2 下行带宽(Mbps，可留空): " down
-      ;;
-    *)
-      proto="vless"
-      ;;
-  esac
-  read -r -p "别名(用于分享链接，留空默认 sing-${port}): " remark
+  if [ -n "${AUTO_PROTO:-}" ]; then
+    proto="$AUTO_PROTO"
+    AUTO_PROTO=""
+  else
+    ui "${C_BOLD}${C_BLUE}入口协议：${C_RESET}"
+    ui "  ${C_YELLOW}1)${C_RESET} VLESS Reality (TCP)"
+    ui "  ${C_YELLOW}2)${C_RESET} Hysteria2 (HY2)"
+    read -r -p "请选择 [1-2]: " proto
+    case "$proto" in
+      2) proto="hy2" ;;
+      *) proto="vless" ;;
+    esac
+  fi
+  if [ "$proto" = "vless" ] && [ ! -f "$MANAGER_CONF" ]; then
+    init_base_config
+  fi
+  if [ "$proto" = "hy2" ] && [ ! -f "$MANAGER_CONF" ]; then
+    init_base_config_silent
+  fi
+  if [ "$proto" = "hy2" ]; then
+    [ -z "${HY2_CERT_MODE:-}" ] && HY2_CERT_MODE="self"
+    [ -z "${HY2_DOMAIN:-}" ] && HY2_DOMAIN=""
+    ui "${C_BOLD}${C_BLUE}HY2 证书类型：${C_RESET}"
+    ui "  ${C_YELLOW}1)${C_RESET} 自签证书(需 insecure)"
+    ui "  ${C_YELLOW}2)${C_RESET} 自动申请证书(Cloudflare DNS API)"
+    read -r -p "请选择 [1-2]: " choice
+    case "$choice" in
+      2)
+        HY2_CERT_MODE="acme"
+        read -r -p "HY2 域名(需解析到本机): " HY2_DOMAIN
+        ;;
+      *)
+        HY2_CERT_MODE="self"
+        ;;
+    esac
+    save_manager_conf
+    read -r -p "HY2 密码(留空自动生成): " hy2_pass
+    if [ -z "$hy2_pass" ]; then
+      hy2_pass="$(gen_hy2_password)"
+      msg "已生成 HY2 密码: ${hy2_pass}"
+    fi
+    read -r -p "HY2 上行带宽(Mbps，可留空): " up
+    read -r -p "HY2 下行带宽(Mbps，可留空): " down
+  fi
+  if [ "$proto" = "hy2" ]; then
+    read -r -p "别名(用于分享链接，留空默认 hy2-${port}): " remark
+  else
+    read -r -p "别名(用于分享链接，留空默认 sing-${port}): " remark
+  fi
   if [ -z "$remark" ]; then
-    remark="sing-${port}"
+    if [ "$proto" = "hy2" ]; then
+      remark="hy2-${port}"
+    else
+      remark="sing-${port}"
+    fi
   fi
   tag="$(next_inbound_tag)"
   echo "${tag}|${port}|${out_tag}|${remark}|${proto}|${hy2_pass}|${up}|${down}" >> "$INBOUNDS_FILE"
-  build_config
+  msg "入口配置完成，正在生成配置并重启..."
+  if ! build_config; then
+    err "生成配置失败，请检查配置输入。"
+    diagnose_start_failure
+    return 1
+  fi
   restart_singbox_with_check "$port"
   test_outbound "$out_tag"
   msg "入口已添加。"
@@ -1771,6 +1814,23 @@ update_inbound_line() {
   mv "$tmp" "$INBOUNDS_FILE"
 }
 
+update_inbound_proto_line() {
+  local idx="$1" new_proto="$2" new_pass="$3" new_up="$4" new_down="$5"
+  local tmp
+  tmp="$(tmp_path inbounds.list)"
+  local i=0
+  while IFS='|' read -r tag port out remark proto hy2_pass up down; do
+    [ -z "$tag" ] && continue
+    i=$((i+1))
+    if [ "$i" -eq "$idx" ]; then
+      echo "${tag}|${port}|${out}|${remark}|${new_proto:-$proto}|${new_pass}|${new_up}|${new_down}" >> "$tmp"
+    else
+      echo "${tag}|${port}|${out}|${remark}|${proto}|${hy2_pass}|${up}|${down}" >> "$tmp"
+    fi
+  done < "$INBOUNDS_FILE"
+  mv "$tmp" "$INBOUNDS_FILE"
+}
+
 remove_inbound_line() {
   local idx="$1"
   local tmp
@@ -1805,6 +1865,44 @@ change_outbound() {
   restart_singbox
   test_outbound "$new_out"
   msg "出口已更新。"
+}
+
+change_protocol() {
+  local idx proto choice hy2_pass up down
+  idx="$(select_inbound_index)" || return 0
+  ui "${C_BOLD}${C_BLUE}入口协议：${C_RESET}"
+  ui "  ${C_YELLOW}1)${C_RESET} VLESS Reality (TCP)"
+  ui "  ${C_YELLOW}2)${C_RESET} Hysteria2 (HY2)"
+  read -r -p "请选择 [1-2]: " proto
+  case "$proto" in
+    2) proto="hy2" ;;
+    *) proto="vless" ;;
+  esac
+  if [ "$proto" = "hy2" ]; then
+    load_manager_conf
+    ui "${C_BOLD}${C_BLUE}HY2 证书类型：${C_RESET}"
+    ui "  ${C_YELLOW}1)${C_RESET} 自签证书(需 insecure)"
+    ui "  ${C_YELLOW}2)${C_RESET} 自动申请证书(Cloudflare DNS API)"
+    read -r -p "请选择 [1-2]: " choice
+    case "$choice" in
+      2)
+        HY2_CERT_MODE="acme"
+        read -r -p "HY2 域名(需解析到本机): " HY2_DOMAIN
+        ;;
+      *)
+        HY2_CERT_MODE="self"
+        ;;
+    esac
+    save_manager_conf
+    read -r -p "HY2 密码: " hy2_pass
+    [ -z "$hy2_pass" ] && die "HY2 密码不能为空。"
+    read -r -p "HY2 上行带宽(Mbps，可留空): " up
+    read -r -p "HY2 下行带宽(Mbps，可留空): " down
+  fi
+  update_inbound_proto_line "$idx" "$proto" "$hy2_pass" "$up" "$down"
+  build_config
+  restart_singbox
+  msg "协议已更新。"
 }
 
 remove_inbound() {
@@ -2004,19 +2102,33 @@ EOF
 }
 
 get_public_ip4() {
+  if ! cmd_exists curl; then
+    return 0
+  fi
   curl -4 -fsSL --max-time 6 https://api.ipify.org 2>/dev/null || true
 }
 
 get_public_ip6() {
+  if ! cmd_exists curl; then
+    return 0
+  fi
   curl -6 -fsSL --max-time 6 https://api64.ipify.org 2>/dev/null || true
 }
 
 show_info() {
+  if [ ! -f "$MANAGER_CONF" ]; then
+    msg "未初始化，请先新增入口或更新基础配置。"
+    return 0
+  fi
   load_manager_conf
-  local host4 host6 host link_host
+  HY2_CERT_MODE="${HY2_CERT_MODE:-self}"
+  HY2_DOMAIN="${HY2_DOMAIN:-}"
+  local host4 host6 host link_host have_share
   link_host=""
+  have_share=0
   if [ -n "${SHARE_HOST:-}" ]; then
     link_host="$SHARE_HOST"
+    have_share=1
   else
     host4="$(get_public_ip4)"
     host6="$(get_public_ip6)"
@@ -2029,7 +2141,12 @@ show_info() {
   msg "  SNI: ${SERVER_NAME}"
   msg "  目标: ${DEST}"
 
-  if [ -n "$link_host" ]; then
+  if [ ! -f "$INBOUNDS_FILE" ] || [ ! -s "$INBOUNDS_FILE" ]; then
+    msg "入口列表：暂无入口。"
+    return 0
+  fi
+
+  if [ "$have_share" -eq 1 ]; then
     host="$link_host"
   fi
 
@@ -2040,9 +2157,11 @@ show_info() {
     alias="${remark:-$tag}"
     frag="$(urlencode "$alias")"
     msg "  ${tag}  端口=${port}  出口=${out}"
-    [ -z "$proto" ] && proto="vless"
+    [ -z "${proto:-}" ] && proto="vless"
+    hy2_pass="${hy2_pass:-}"
     if [ "$proto" = "hy2" ]; then
       local insecure_q="" sni_name
+      local hy2_pass_enc
       sni_name="${SERVER_NAME}"
       if [ "${HY2_CERT_MODE:-self}" = "acme" ] && [ -n "${HY2_DOMAIN:-}" ]; then
         sni_name="${HY2_DOMAIN}"
@@ -2050,21 +2169,26 @@ show_info() {
       if [ "${HY2_CERT_MODE:-self}" = "self" ]; then
         insecure_q="&insecure=1"
       fi
-      if [ -n "$link_host" ]; then
-        msg "  hysteria2://${hy2_pass}@${host}:${port}?sni=${sni_name}&alpn=h3${insecure_q}#${frag}"
+      if [ -z "$hy2_pass" ]; then
+        msg "  (HY2 密码为空，无法生成分享链接)"
+        continue
+      fi
+      hy2_pass_enc="$(urlencode "$hy2_pass")"
+      if [ "$have_share" -eq 1 ]; then
+        msg "  hysteria2://${hy2_pass_enc}@${host}:${port}?sni=${sni_name}&alpn=h3${insecure_q}#${frag}"
       else
         if [ -n "$host4" ]; then
-          msg "  hysteria2://${hy2_pass}@${host4}:${port}?sni=${sni_name}&alpn=h3${insecure_q}#${frag}"
+          msg "  hysteria2://${hy2_pass_enc}@${host4}:${port}?sni=${sni_name}&alpn=h3${insecure_q}#${frag}"
         fi
         if [ -n "$host6" ]; then
-          msg "  hysteria2://${hy2_pass}@[${host6}]:${port}?sni=${sni_name}&alpn=h3${insecure_q}#${frag}"
+          msg "  hysteria2://${hy2_pass_enc}@[${host6}]:${port}?sni=${sni_name}&alpn=h3${insecure_q}#${frag}"
         fi
         if [ -z "$host4" ] && [ -z "$host6" ]; then
-          msg "  hysteria2://${hy2_pass}@SERVER_IP:${port}?sni=${sni_name}&alpn=h3${insecure_q}#${frag}"
+          msg "  hysteria2://${hy2_pass_enc}@SERVER_IP:${port}?sni=${sni_name}&alpn=h3${insecure_q}#${frag}"
         fi
       fi
     else
-      if [ -n "$link_host" ]; then
+      if [ "$have_share" -eq 1 ]; then
         msg "  vless://${UUID}@${host}:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
       else
         if [ -n "$host4" ]; then
@@ -2117,10 +2241,19 @@ install_flow() {
   write_openrc_service
   setup_logrotate
 
+  msg "安装完成。"
+  msg "请在菜单中新增入口并选择协议(VLESS/HY2)。"
+}
+
+init_base_config() {
+  need_root
+  ensure_dirs
   UUID="$(gen_uuid)"
   SHORT_ID="$(gen_short_id)"
   FINGERPRINT="chrome"
   gen_reality_keys
+  HY2_CERT_MODE="self"
+  HY2_DOMAIN=""
 
   read -r -p "Reality SNI(建议常见 TLS 域名，默认: ${DEFAULT_SNI}): " SERVER_NAME
   SERVER_NAME="${SERVER_NAME:-${DEFAULT_SNI}}"
@@ -2130,13 +2263,23 @@ install_flow() {
 
   save_manager_conf
   > "$INBOUNDS_FILE"
+}
 
-  msg "添加首个入口："
-  add_inbound
-
-  build_config
-  start_singbox
-  show_info
+init_base_config_silent() {
+  need_root
+  ensure_dirs
+  UUID=""
+  SHORT_ID=""
+  PRIVATE_KEY=""
+  PUBLIC_KEY=""
+  FINGERPRINT="chrome"
+  HY2_CERT_MODE="self"
+  HY2_DOMAIN=""
+  SERVER_NAME="${DEFAULT_SNI}"
+  DEST="${SERVER_NAME}:443"
+  SHARE_HOST=""
+  save_manager_conf
+  > "$INBOUNDS_FILE"
 }
 
 uninstall_all() {
@@ -2197,7 +2340,13 @@ show_status() {
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" >/dev/null 2>&1; then
       msg "服务状态: 运行中 (PID $(cat "$PID_FILE"))"
     else
-      msg "服务状态: 未运行"
+      local p
+      p="$(pgrep -f "sing-box run -c ${CONFIG_DIR}/config.json" 2>/dev/null | head -n1 || true)"
+      if [ -n "$p" ]; then
+        msg "服务状态: 运行中 (PID ${p})"
+      else
+        msg "服务状态: 未运行"
+      fi
     fi
   fi
   if [ -f /var/log/sing-box/sing-box.log ]; then
@@ -2211,6 +2360,17 @@ restart_service() {
   msg "服务已重启。"
 }
 
+diagnose_start_failure() {
+  if [ -x "$SB_BIN" ] && [ -f "${CONFIG_DIR}/config.json" ]; then
+    ui "sing-box 配置校验："
+    "$SB_BIN" check -c "${CONFIG_DIR}/config.json" 2>&1 | head -n 50 >&2 || true
+  fi
+  if [ -f /var/log/sing-box/sing-box.log ]; then
+    ui "sing-box 最近日志："
+    tail -n 50 /var/log/sing-box/sing-box.log >&2 || true
+  fi
+}
+
 main_menu() {
   local choice
   while true; do
@@ -2218,32 +2378,38 @@ main_menu() {
     menu_title "sing-box 一键脚本"
     msg "${C_DIM}(${OS_NAME} ${OS_VERSION} / ${ARCH_LABEL})${C_RESET}"
     menu_sep
-    if [ -f "$MANAGER_CONF" ] && [ -x "$SB_BIN" ]; then
+    if [ -x "$SB_BIN" ]; then
       sanitize_inbounds
       setup_logrotate
       menu_item 1 "新增入口"
       menu_item 2 "修改入口端口"
-      menu_item 3 "修改入口出口"
-      menu_item 4 "自定义出口管理"
-      menu_item 5 "删除入口"
-      menu_item 6 "更新基础配置(SNI/UUID/密钥)"
-      menu_item 7 "显示连接信息"
-      menu_item 8 "查看运行状态"
-      menu_item 9 "重启服务"
-      menu_item 10 "卸载"
+      menu_item 3 "修改入口协议"
+      menu_item 4 "修改入口出口"
+      menu_item 5 "自定义出口管理"
+      menu_item 6 "删除入口"
+      menu_item 7 "更新基础配置(SNI/UUID/密钥)"
+      menu_item 8 "显示连接信息"
+      menu_item 9 "查看运行状态"
+      menu_item 10 "重启服务"
+      menu_item 11 "卸载"
       menu_item 0 "退出"
       read -r -p "请选择: " choice
+      if [ ! -f "$MANAGER_CONF" ] && [ "$choice" != "1" ] && [ "$choice" != "0" ] && [ "$choice" != "11" ]; then
+        msg "请先通过“新增入口”初始化基础配置。"
+        continue
+      fi
       case "$choice" in
         1) add_inbound ;;
         2) change_port ;;
-        3) change_outbound ;;
-        4) manage_custom_outbounds ;;
-        5) remove_inbound ;;
-        6) update_base_config ;;
-        7) show_info ;;
-        8) show_status ;;
-        9) restart_service ;;
-        10) uninstall_all ;;
+        3) change_protocol ;;
+        4) change_outbound ;;
+        5) manage_custom_outbounds ;;
+        6) remove_inbound ;;
+        7) update_base_config ;;
+        8) show_info ;;
+        9) show_status ;;
+        10) restart_service ;;
+        11) uninstall_all ;;
         0) exit 0 ;;
       esac
     else
