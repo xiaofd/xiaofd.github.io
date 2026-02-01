@@ -12,6 +12,8 @@ MANAGER_CONF="${CONFIG_DIR}/manager.conf"
 INBOUNDS_FILE="${CONFIG_DIR}/inbounds.list"
 OUTBOUNDS_DIR="${CONFIG_DIR}/outbounds.d"
 ENDPOINTS_DIR="${CONFIG_DIR}/endpoints.d"
+HY2_CERT="${CONFIG_DIR}/hy2.crt"
+HY2_KEY="${CONFIG_DIR}/hy2.key"
 SERVICE_FILE="/etc/systemd/system/sing-box.service"
 LOGROTATE_FILE="/etc/logrotate.d/sing-box"
 PID_FILE="/run/sing-box.pid"
@@ -162,11 +164,11 @@ install_deps() {
   ensure_tmp_dir
   if is_alpine; then
     cmd_exists apk || die "未找到 apk，无法安装依赖。"
-    apk add --no-cache curl ca-certificates logrotate
+    apk add --no-cache curl ca-certificates logrotate openssl
     return 0
   fi
   apt-get update -y
-  apt-get install -y curl ca-certificates logrotate
+  apt-get install -y curl ca-certificates logrotate openssl
 }
 
 detect_arch_singbox() {
@@ -414,6 +416,8 @@ SERVER_NAME=${SERVER_NAME}
 DEST=${DEST}
 FINGERPRINT=${FINGERPRINT}
 SHARE_HOST=${SHARE_HOST}
+HY2_CERT_MODE=${HY2_CERT_MODE}
+HY2_DOMAIN=${HY2_DOMAIN}
 EOF
 }
 
@@ -423,6 +427,7 @@ load_manager_conf() {
   fi
   # shellcheck source=/etc/sing-box/manager.conf
   . "$MANAGER_CONF"
+  [ -z "${HY2_CERT_MODE:-}" ] && HY2_CERT_MODE="self"
 }
 
 ensure_direct_outbounds() {
@@ -440,6 +445,120 @@ EOF
   "domain_strategy": "ipv6_only"
 }
 EOF
+}
+
+ensure_hy2_cert() {
+  if [ -s "$HY2_CERT" ] && [ -s "$HY2_KEY" ]; then
+    return 0
+  fi
+  if [ "${HY2_CERT_MODE:-self}" = "acme" ]; then
+    issue_hy2_acme_cert
+    return 0
+  fi
+  cmd_exists openssl || die "未找到 openssl，无法生成 HY2 证书。"
+  msg "生成 Hysteria2 自签证书..."
+  openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+    -subj "/CN=${SERVER_NAME}" \
+    -keyout "$HY2_KEY" -out "$HY2_CERT" >/dev/null 2>&1
+  chmod 600 "$HY2_KEY"
+}
+
+issue_hy2_acme_cert() {
+  local domain token account_id ip_choice ip_addr
+  domain="${HY2_DOMAIN:-}"
+  if [ -z "$domain" ]; then
+    read -r -p "HY2 证书域名(需解析到本机): " domain
+  fi
+  [ -z "$domain" ] && die "域名不能为空。"
+  read -r -p "Cloudflare Token (DNS): " token
+  read -r -p "Cloudflare Account ID: " account_id
+  [ -z "$token" ] && die "CF Token 不能为空。"
+  [ -z "$account_id" ] && die "CF Account ID 不能为空。"
+
+  ui "${C_BOLD}${C_BLUE}解析类型：${C_RESET}"
+  ui "  ${C_YELLOW}1)${C_RESET} IPv4 (A 记录，默认)"
+  ui "  ${C_YELLOW}2)${C_RESET} IPv6 (AAAA 记录)"
+  read -r -p "请选择 [1-2]: " ip_choice
+  case "$ip_choice" in
+    2)
+      ip_addr="$(get_public_ip6)"
+      [ -z "$ip_addr" ] && die "未获取到 IPv6 公网地址。"
+      cf_upsert_dns_record "$domain" "AAAA" "$ip_addr" "$token"
+      ;;
+    *)
+      ip_addr="$(get_public_ip4)"
+      [ -z "$ip_addr" ] && die "未获取到 IPv4 公网地址。"
+      cf_upsert_dns_record "$domain" "A" "$ip_addr" "$token"
+      ;;
+  esac
+
+  if [ ! -x /root/.acme.sh/acme.sh ]; then
+    msg "安装 acme.sh..."
+    curl -fsSL https://get.acme.sh | sh
+  fi
+  export CF_Token="$token"
+  export CF_Account_ID="$account_id"
+  /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$domain" --keylength 2048 || die "申请证书失败。"
+  /root/.acme.sh/acme.sh --install-cert -d "$domain" \
+    --key-file "$HY2_KEY" \
+    --fullchain-file "$HY2_CERT" || die "安装证书失败。"
+  chmod 600 "$HY2_KEY"
+  HY2_DOMAIN="$domain"
+  HY2_CERT_MODE="acme"
+  save_manager_conf
+  msg "证书已签发并安装: ${domain}"
+}
+
+cf_upsert_dns_record() {
+  local full_domain="$1" record_type="$2" ip_addr="$3" token="$4"
+  local zone_name zone_id record_id payload resp
+  zone_name="$(cf_find_zone "$full_domain" "$token")"
+  [ -z "$zone_name" ] && die "未找到域名对应的 Zone，请检查域名是否在 Cloudflare。"
+  zone_id="$(cf_get_zone_id "$zone_name" "$token")"
+  [ -z "$zone_id" ] && die "未获取到 Zone ID，请检查 Token 权限。"
+  record_id="$(cf_get_record_id "$zone_id" "$record_type" "$full_domain" "$token")"
+  payload="{\"type\":\"${record_type}\",\"name\":\"${full_domain}\",\"content\":\"${ip_addr}\",\"ttl\":120,\"proxied\":false}"
+  if [ -n "$record_id" ]; then
+    resp="$(curl -fsSL -X PUT "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${record_id}" \
+      -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+      --data "$payload" || true)"
+  else
+    resp="$(curl -fsSL -X POST "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
+      -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+      --data "$payload" || true)"
+  fi
+  echo "$resp" | grep -q '"success":true' || die "Cloudflare DNS 记录设置失败。"
+  msg "DNS 记录已更新: ${full_domain} -> ${ip_addr}"
+}
+
+cf_find_zone() {
+  local full_domain="$1" token="$2" candidate
+  candidate="$full_domain"
+  while [ -n "$candidate" ]; do
+    if cf_get_zone_id "$candidate" "$token" >/dev/null; then
+      echo "$candidate"
+      return 0
+    fi
+    candidate="${candidate#*.}"
+    [ "$candidate" = "$full_domain" ] && break
+  done
+  echo ""
+}
+
+cf_get_zone_id() {
+  local zone_name="$1" token="$2" resp
+  resp="$(curl -fsSL -G "https://api.cloudflare.com/client/v4/zones" \
+    -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+    --data-urlencode "name=${zone_name}" --data-urlencode "status=active" || true)"
+  echo "$resp" | sed -n 's/.*"id":"\([a-f0-9]\{32\}\)".*/\1/p' | head -n1
+}
+
+cf_get_record_id() {
+  local zone_id="$1" record_type="$2" record_name="$3" token="$4" resp
+  resp="$(curl -fsSL -G "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
+    -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+    --data-urlencode "type=${record_type}" --data-urlencode "name=${record_name}" || true)"
+  echo "$resp" | sed -n 's/.*"id":"\([a-f0-9]\{32\}\)".*/\1/p' | head -n1
 }
 
 port_in_config() {
@@ -1533,18 +1652,49 @@ next_inbound_tag() {
 }
 
 add_inbound() {
-  local port out_tag tag remark
+  local port out_tag tag remark proto hy2_pass up down choice
   port="$(prompt_port)"
   out_tag="$(choose_outbound)"
   if ! echo "$out_tag" | grep -qE '^[A-Za-z0-9_]+$'; then
     die "出口选择异常，请重试。"
   fi
+  ui "${C_BOLD}${C_BLUE}入口协议：${C_RESET}"
+  ui "  ${C_YELLOW}1)${C_RESET} VLESS Reality (TCP)"
+  ui "  ${C_YELLOW}2)${C_RESET} Hysteria2 (HY2)"
+  read -r -p "请选择 [1-2]: " proto
+  case "$proto" in
+    2)
+      proto="hy2"
+      load_manager_conf
+      ui "${C_BOLD}${C_BLUE}HY2 证书类型：${C_RESET}"
+      ui "  ${C_YELLOW}1)${C_RESET} 自签证书(需 insecure)"
+      ui "  ${C_YELLOW}2)${C_RESET} 自动申请证书(Cloudflare DNS API)"
+      read -r -p "请选择 [1-2]: " choice
+      case "$choice" in
+        2)
+          HY2_CERT_MODE="acme"
+          read -r -p "HY2 域名(需解析到本机): " HY2_DOMAIN
+          ;;
+        *)
+          HY2_CERT_MODE="self"
+          ;;
+      esac
+      save_manager_conf
+      read -r -p "HY2 密码: " hy2_pass
+      [ -z "$hy2_pass" ] && die "HY2 密码不能为空。"
+      read -r -p "HY2 上行带宽(Mbps，可留空): " up
+      read -r -p "HY2 下行带宽(Mbps，可留空): " down
+      ;;
+    *)
+      proto="vless"
+      ;;
+  esac
   read -r -p "别名(用于分享链接，留空默认 sing-${port}): " remark
   if [ -z "$remark" ]; then
     remark="sing-${port}"
   fi
   tag="$(next_inbound_tag)"
-  echo "${tag}|${port}|${out_tag}|${remark}" >> "$INBOUNDS_FILE"
+  echo "${tag}|${port}|${out_tag}|${remark}|${proto}|${hy2_pass}|${up}|${down}" >> "$INBOUNDS_FILE"
   build_config
   restart_singbox_with_check "$port"
   test_outbound "$out_tag"
@@ -1556,7 +1706,7 @@ sanitize_inbounds() {
   [ -f "$INBOUNDS_FILE" ] || return 0
   tmp="$(tmp_path inbounds.list)"
   > "$tmp"
-  while IFS='|' read -r tag port out remark; do
+  while IFS='|' read -r tag port out remark proto hy2_pass up down; do
     [ -z "$tag" ] && continue
     if ! echo "$tag" | grep -qE '^[A-Za-z0-9_]+$'; then
       continue
@@ -1570,7 +1720,8 @@ sanitize_inbounds() {
     if [ -z "$out" ] || ! echo "$out" | grep -qE '^[A-Za-z0-9_]+$'; then
       continue
     fi
-    echo "${tag}|${port}|${out}|${remark}" >> "$tmp"
+    [ -z "$proto" ] && proto="vless"
+    echo "${tag}|${port}|${out}|${remark}|${proto}|${hy2_pass}|${up}|${down}" >> "$tmp"
   done < "$INBOUNDS_FILE"
   mv "$tmp" "$INBOUNDS_FILE"
 }
@@ -1582,10 +1733,11 @@ list_inbounds() {
     ui "暂无入口。"
     return 1
   fi
-  while IFS='|' read -r tag port out remark; do
+  while IFS='|' read -r tag port out remark proto hy2_pass up down; do
     [ -z "$tag" ] && continue
     i=$((i+1))
-    ui "  ${i}) ${tag}  端口=${port}  出口=${out}"
+    [ -z "$proto" ] && proto="vless"
+    ui "  ${i}) ${tag}  端口=${port}  出口=${out}  协议=${proto}"
   done < "$INBOUNDS_FILE"
   return 0
 }
@@ -1607,13 +1759,13 @@ update_inbound_line() {
   local tmp
   tmp="$(tmp_path inbounds.list)"
   local i=0
-  while IFS='|' read -r tag port out remark; do
+  while IFS='|' read -r tag port out remark proto hy2_pass up down; do
     [ -z "$tag" ] && continue
     i=$((i+1))
     if [ "$i" -eq "$idx" ]; then
-      echo "${tag}|${new_port:-$port}|${new_out:-$out}|${remark}" >> "$tmp"
+      echo "${tag}|${new_port:-$port}|${new_out:-$out}|${remark}|${proto}|${hy2_pass}|${up}|${down}" >> "$tmp"
     else
-      echo "${tag}|${port}|${out}|${remark}" >> "$tmp"
+      echo "${tag}|${port}|${out}|${remark}|${proto}|${hy2_pass}|${up}|${down}" >> "$tmp"
     fi
   done < "$INBOUNDS_FILE"
   mv "$tmp" "$INBOUNDS_FILE"
@@ -1624,11 +1776,11 @@ remove_inbound_line() {
   local tmp
   tmp="$(tmp_path inbounds.list)"
   local i=0
-  while IFS='|' read -r tag port out remark; do
+  while IFS='|' read -r tag port out remark proto hy2_pass up down; do
     [ -z "$tag" ] && continue
     i=$((i+1))
     if [ "$i" -ne "$idx" ]; then
-      echo "${tag}|${port}|${out}|${remark}" >> "$tmp"
+      echo "${tag}|${port}|${out}|${remark}|${proto}|${hy2_pass}|${up}|${down}" >> "$tmp"
     fi
   done < "$INBOUNDS_FILE"
   mv "$tmp" "$INBOUNDS_FILE"
@@ -1688,6 +1840,19 @@ build_config() {
   tmp="$(tmp_path config.json)"
   IFS='|' read -r dest_host dest_port <<< "$(split_host_port "$DEST")"
 
+  local hy2_needed=0
+  while IFS='|' read -r tag port out remark proto hy2_pass up down; do
+    [ -z "$tag" ] && continue
+    [ -z "$proto" ] && proto="vless"
+    if [ "$proto" = "hy2" ]; then
+      hy2_needed=1
+      break
+    fi
+  done < "$INBOUNDS_FILE"
+  if [ "$hy2_needed" -eq 1 ]; then
+    ensure_hy2_cert
+  fi
+
   local used_outbounds
   used_outbounds="$(awk -F'|' 'NF>=3{print $3}' "$INBOUNDS_FILE" | awk '!seen[$0]++')"
 
@@ -1714,7 +1879,7 @@ build_config() {
     echo '    ],'
     echo '    "rules": ['
     local dns_rule_count=0
-    while IFS='|' read -r tag port out remark; do
+    while IFS='|' read -r tag port out remark proto hy2_pass up down; do
       [ -z "$tag" ] && continue
       if [ "$dns_rule_count" -gt 0 ]; then
         echo '      ,'
@@ -1727,13 +1892,37 @@ build_config() {
     echo "    \"strategy\": \"${dns_strategy}\""
     echo '  },'
     echo '  "inbounds": ['
-    while IFS='|' read -r tag port out remark; do
+    while IFS='|' read -r tag port out remark proto hy2_pass up down; do
       [ -z "$tag" ] && continue
+      [ -z "$proto" ] && proto="vless"
       inbound_count=$((inbound_count+1))
       if [ "$inbound_count" -gt 1 ]; then
         echo '    ,'
       fi
-      cat <<EOF
+      if [ "$proto" = "hy2" ]; then
+        cat <<EOF
+    {
+      "type": "hysteria2",
+      "tag": "$(json_escape "$tag")",
+      "listen": "0.0.0.0",
+      "listen_port": ${port},
+      "sniff": true,
+      "sniff_override_destination": true,
+      "users": [
+        {
+          "password": "$(json_escape "$hy2_pass")"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "alpn": ["h3"],
+        "certificate_path": "$(json_escape "$HY2_CERT")",
+        "key_path": "$(json_escape "$HY2_KEY")"
+      }$( [ -n "$up" ] && printf ',\n      "up_mbps": %s' "$up" )$( [ -n "$down" ] && printf ',\n      "down_mbps": %s' "$down" )
+    }
+EOF
+      else
+        cat <<EOF
     {
       "type": "vless",
       "tag": "$(json_escape "$tag")",
@@ -1762,6 +1951,7 @@ build_config() {
       }
     }
 EOF
+      fi
     done < "$INBOUNDS_FILE"
     echo '  ],'
     echo '  "outbounds": ['
@@ -1789,7 +1979,7 @@ EOF
     echo '  "route": {'
     echo '    "auto_detect_interface": true,'
     echo '    "rules": ['
-    while IFS='|' read -r tag port out remark; do
+    while IFS='|' read -r tag port out remark proto hy2_pass up down; do
       [ -z "$tag" ] && continue
       if [ ! -f "${OUTBOUNDS_DIR}/${out}.json" ] && [ ! -f "${ENDPOINTS_DIR}/${out}.json" ]; then
         die "未找到出口: ${out}"
@@ -1844,23 +2034,48 @@ show_info() {
   fi
 
   msg "入口列表："
-  while IFS='|' read -r tag port out remark; do
+  while IFS='|' read -r tag port out remark proto hy2_pass up down; do
     [ -z "$tag" ] && continue
     local alias frag
     alias="${remark:-$tag}"
     frag="$(urlencode "$alias")"
     msg "  ${tag}  端口=${port}  出口=${out}"
-    if [ -n "$link_host" ]; then
-      msg "  vless://${UUID}@${host}:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
+    [ -z "$proto" ] && proto="vless"
+    if [ "$proto" = "hy2" ]; then
+      local insecure_q="" sni_name
+      sni_name="${SERVER_NAME}"
+      if [ "${HY2_CERT_MODE:-self}" = "acme" ] && [ -n "${HY2_DOMAIN:-}" ]; then
+        sni_name="${HY2_DOMAIN}"
+      fi
+      if [ "${HY2_CERT_MODE:-self}" = "self" ]; then
+        insecure_q="&insecure=1"
+      fi
+      if [ -n "$link_host" ]; then
+        msg "  hysteria2://${hy2_pass}@${host}:${port}?sni=${sni_name}&alpn=h3${insecure_q}#${frag}"
+      else
+        if [ -n "$host4" ]; then
+          msg "  hysteria2://${hy2_pass}@${host4}:${port}?sni=${sni_name}&alpn=h3${insecure_q}#${frag}"
+        fi
+        if [ -n "$host6" ]; then
+          msg "  hysteria2://${hy2_pass}@[${host6}]:${port}?sni=${sni_name}&alpn=h3${insecure_q}#${frag}"
+        fi
+        if [ -z "$host4" ] && [ -z "$host6" ]; then
+          msg "  hysteria2://${hy2_pass}@SERVER_IP:${port}?sni=${sni_name}&alpn=h3${insecure_q}#${frag}"
+        fi
+      fi
     else
-      if [ -n "$host4" ]; then
-        msg "  vless://${UUID}@${host4}:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
-      fi
-      if [ -n "$host6" ]; then
-        msg "  vless://${UUID}@[${host6}]:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
-      fi
-      if [ -z "$host4" ] && [ -z "$host6" ]; then
-        msg "  vless://${UUID}@SERVER_IP:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
+      if [ -n "$link_host" ]; then
+        msg "  vless://${UUID}@${host}:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
+      else
+        if [ -n "$host4" ]; then
+          msg "  vless://${UUID}@${host4}:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
+        fi
+        if [ -n "$host6" ]; then
+          msg "  vless://${UUID}@[${host6}]:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
+        fi
+        if [ -z "$host4" ] && [ -z "$host6" ]; then
+          msg "  vless://${UUID}@SERVER_IP:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
+        fi
       fi
     fi
   done < "$INBOUNDS_FILE"
