@@ -18,7 +18,7 @@ while [[ $# -ge 1 ]]; do
       shift
       ;;
     *)
-      echo -ne " Usage:\n\t -p/--password RPC password default(xiaofd.win) \n\t -u/--user RPC username default(xiaofd) \n\t --port RPC port default(9091) recommend not modified"
+      echo -ne " Usage:\n\t -p/--password RPC password default(PASSWORD) \n\t -u/--user RPC username default(xiaofd) \n\t --port RPC port default(9091) recommend not modified"
       exit 1;
       ;;
     esac
@@ -30,7 +30,7 @@ TRANSPASS=$TRANSPASStmp
 
 [ -z "$TRANSPORTtmp" ] && TRANSPORT=9091
 [ -z "$TRANSUSRtmp" ] && TRANSUSR='xiaofd'
-[ -z "$TRANSPASStmp" ] && TRANSPASS='xiaofd.win'
+[ -z "$TRANSPASStmp" ] && TRANSPASS='PASSWORD'
 
 apt update
 apt install -y transmission-daemon transmission-remote-cli wget
