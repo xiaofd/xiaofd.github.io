@@ -486,7 +486,10 @@ issue_hy2_acme_cert() {
     read -r -p "HY2 证书域名(需解析到本机): " domain
   fi
   [ -z "$domain" ] && die "域名不能为空。"
-  read -r -p "Cloudflare Token (DNS): " token
+  token="${CF_Token:-}"
+  if [ -z "$token" ]; then
+    read -r -p "Cloudflare Token (DNS): " token
+  fi
   [ -z "$token" ] && die "CF Token 不能为空。"
 
   ui "${C_BOLD}${C_BLUE}解析类型：${C_RESET}"
