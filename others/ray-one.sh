@@ -606,6 +606,34 @@ urlencode() {
   echo "$out"
 }
 
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+is_ip_addr() {
+  local v="$1"
+  if echo "$v" | grep -qE '^[0-9]+(\\.[0-9]+){3}$'; then
+    return 0
+  fi
+  if echo "$v" | grep -q ":"; then
+    return 0
+  fi
+  return 1
+}
+
+get_outbound_domains() {
+  local tag="$1" f
+  if [ -f "${OUTBOUNDS_DIR}/${tag}.json" ]; then
+    f="${OUTBOUNDS_DIR}/${tag}.json"
+  else
+    return 0
+  fi
+  sed -n 's/.*"server"[[:space:]]*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p' "$f"
+  sed -n 's/.*"address"[[:space:]]*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p' "$f"
+  sed -n 's/.*"serverName"[[:space:]]*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p' "$f"
+  sed -n 's/.*"Host"[[:space:]]*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p' "$f"
+}
+
 base64_decode() {
   local in="$1" pad padstr
   in="${in//-/+}"
@@ -1714,6 +1742,23 @@ build_config() {
     dns_query_strategy="UseIPv6"
   fi
   tmp="$(tmp_path config.json)"
+  local used_outbounds dns_bootstrap_domains
+  used_outbounds="$(awk -F'|' 'NF>=3{print $3}' "$INBOUNDS_FILE" | awk '!seen[$0]++')"
+  dns_bootstrap_domains=""
+  if [ -n "$used_outbounds" ]; then
+    while IFS= read -r out_tag; do
+      [ -z "$out_tag" ] && continue
+      while IFS= read -r srv; do
+        [ -z "$srv" ] && continue
+        if ! is_ip_addr "$srv"; then
+          dns_bootstrap_domains="${dns_bootstrap_domains}${srv}\n"
+        fi
+      done < <(get_outbound_domains "$out_tag")
+    done <<< "$used_outbounds"
+    if [ -n "$dns_bootstrap_domains" ]; then
+      dns_bootstrap_domains="$(printf "%b" "$dns_bootstrap_domains" | awk '!seen[$0]++')"
+    fi
+  fi
   local inbound_count=0 outbound_count=0 rule_count=0
   {
     echo '{'
@@ -1724,6 +1769,19 @@ build_config() {
     echo '  },'
     echo '  "dns": {'
     echo '    "servers": ['
+    if [ -n "$dns_bootstrap_domains" ]; then
+      echo '      { "address": "https://1.1.1.1/dns-query", "domains": ['
+      local dns_domain_count=0
+      while IFS= read -r domain; do
+        [ -z "$domain" ] && continue
+        if [ "$dns_domain_count" -gt 0 ]; then
+          echo '        ,'
+        fi
+        dns_domain_count=$((dns_domain_count+1))
+        echo "        \"domain:$(json_escape "$domain")\""
+      done <<< "$dns_bootstrap_domains"
+      echo '      ] },'
+    fi
     echo '      "https://1.1.1.1/dns-query",'
     echo '      "https://8.8.8.8/dns-query",'
     echo '      "https://223.5.5.5/dns-query",'
