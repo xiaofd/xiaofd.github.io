@@ -757,11 +757,14 @@ get_outbound_domains() {
     f=""
   fi
   if [ -n "$f" ]; then
-    grep -oE '"(server|address|server_name|serverName|sni|host|Host)"[[:space:]]*:[[:space:]]*"[^"]+"' "$f" \
-      | sed -n 's/.*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p'
+    for key in server address server_name serverName sni host Host; do
+      sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\\([^\"]\\+\\)\".*/\\1/p" "$f"
+    done
   fi
   if [ -f "${OUTBOUNDS_DIR}/${tag}.link" ]; then
-    grep -oE '([A-Za-z0-9.-]+\\.[A-Za-z]{2,})' "${OUTBOUNDS_DIR}/${tag}.link"
+    sed -n 's/.*@\\([^:/?#]*\\).*/\\1/p' "${OUTBOUNDS_DIR}/${tag}.link"
+    sed -n 's/.*[?&]sni=\\([^&]*\\).*/\\1/p' "${OUTBOUNDS_DIR}/${tag}.link"
+    sed -n 's/.*[?&]host=\\([^&]*\\).*/\\1/p' "${OUTBOUNDS_DIR}/${tag}.link"
   fi
 }
 
