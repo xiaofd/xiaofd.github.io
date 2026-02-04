@@ -754,12 +754,15 @@ get_outbound_domains() {
   elif [ -f "${ENDPOINTS_DIR}/${tag}.json" ]; then
     f="${ENDPOINTS_DIR}/${tag}.json"
   else
-    return 0
+    f=""
   fi
-  sed -n 's/.*"server"[[:space:]]*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p' "$f"
-  sed -n 's/.*"address"[[:space:]]*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p' "$f"
-  sed -n 's/.*"server_name"[[:space:]]*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p' "$f"
-  sed -n 's/.*"Host"[[:space:]]*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p' "$f"
+  if [ -n "$f" ]; then
+    grep -oE '"(server|address|server_name|serverName|sni|host|Host)"[[:space:]]*:[[:space:]]*"[^"]+"' "$f" \
+      | sed -n 's/.*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p'
+  fi
+  if [ -f "${OUTBOUNDS_DIR}/${tag}.link" ]; then
+    grep -oE '([A-Za-z0-9.-]+\\.[A-Za-z]{2,})' "${OUTBOUNDS_DIR}/${tag}.link"
+  fi
 }
 
 json_escape() {

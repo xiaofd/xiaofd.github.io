@@ -627,12 +627,15 @@ get_outbound_domains() {
   if [ -f "${OUTBOUNDS_DIR}/${tag}.json" ]; then
     f="${OUTBOUNDS_DIR}/${tag}.json"
   else
-    return 0
+    f=""
   fi
-  sed -n 's/.*"server"[[:space:]]*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p' "$f"
-  sed -n 's/.*"address"[[:space:]]*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p' "$f"
-  sed -n 's/.*"serverName"[[:space:]]*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p' "$f"
-  sed -n 's/.*"Host"[[:space:]]*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p' "$f"
+  if [ -n "$f" ]; then
+    grep -oE '"(server|address|server_name|serverName|sni|host|Host)"[[:space:]]*:[[:space:]]*"[^"]+"' "$f" \
+      | sed -n 's/.*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p'
+  fi
+  if [ -f "${OUTBOUNDS_DIR}/${tag}.link" ]; then
+    grep -oE '([A-Za-z0-9.-]+\\.[A-Za-z]{2,})' "${OUTBOUNDS_DIR}/${tag}.link"
+  fi
 }
 
 base64_decode() {
