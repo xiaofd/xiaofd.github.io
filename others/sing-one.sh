@@ -746,7 +746,7 @@ is_ip_addr() {
   return 1
 }
 
-get_outbound_servers() {
+get_outbound_domains() {
   local tag="$1" f
   if [ -f "${OUTBOUNDS_DIR}/${tag}.json" ]; then
     f="${OUTBOUNDS_DIR}/${tag}.json"
@@ -757,6 +757,8 @@ get_outbound_servers() {
   fi
   sed -n 's/.*"server"[[:space:]]*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p' "$f"
   sed -n 's/.*"address"[[:space:]]*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p' "$f"
+  sed -n 's/.*"server_name"[[:space:]]*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p' "$f"
+  sed -n 's/.*"Host"[[:space:]]*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p' "$f"
 }
 
 json_escape() {
@@ -1989,7 +1991,7 @@ build_config() {
         if ! is_ip_addr "$srv"; then
           dns_bootstrap_domains="${dns_bootstrap_domains}${srv}\n"
         fi
-      done < <(get_outbound_servers "$out_tag")
+      done < <(get_outbound_domains "$out_tag")
     done <<< "$used_outbounds"
     if [ -n "$dns_bootstrap_domains" ]; then
       dns_bootstrap_domains="$(printf "%b" "$dns_bootstrap_domains" | awk '!seen[$0]++')"
