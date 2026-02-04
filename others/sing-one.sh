@@ -2412,6 +2412,7 @@ show_status() {
 restart_service() {
   restart_singbox
   msg "服务已重启。"
+  show_status
 }
 
 diagnose_start_failure() {

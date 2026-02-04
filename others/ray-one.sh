@@ -2051,6 +2051,7 @@ show_status() {
 restart_service() {
   restart_xray
   msg "服务已重启。"
+  show_status
 }
 
 main_menu() {
