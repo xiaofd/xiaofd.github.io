@@ -735,6 +735,30 @@ urlencode() {
   echo "$out"
 }
 
+is_ip_addr() {
+  local v="$1"
+  if echo "$v" | grep -qE '^[0-9]+(\\.[0-9]+){3}$'; then
+    return 0
+  fi
+  if echo "$v" | grep -q ":"; then
+    return 0
+  fi
+  return 1
+}
+
+get_outbound_servers() {
+  local tag="$1" f
+  if [ -f "${OUTBOUNDS_DIR}/${tag}.json" ]; then
+    f="${OUTBOUNDS_DIR}/${tag}.json"
+  elif [ -f "${ENDPOINTS_DIR}/${tag}.json" ]; then
+    f="${ENDPOINTS_DIR}/${tag}.json"
+  else
+    return 0
+  fi
+  sed -n 's/.*"server"[[:space:]]*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p' "$f"
+  sed -n 's/.*"address"[[:space:]]*:[[:space:]]*"\\([^"]\\+\\)".*/\\1/p' "$f"
+}
+
 json_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
@@ -1956,6 +1980,21 @@ build_config() {
 
   local used_outbounds
   used_outbounds="$(awk -F'|' 'NF>=3{print $3}' "$INBOUNDS_FILE" | awk '!seen[$0]++')"
+  local dns_bootstrap_domains=""
+  if [ -n "$used_outbounds" ]; then
+    while IFS= read -r out_tag; do
+      [ -z "$out_tag" ] && continue
+      while IFS= read -r srv; do
+        [ -z "$srv" ] && continue
+        if ! is_ip_addr "$srv"; then
+          dns_bootstrap_domains="${dns_bootstrap_domains}${srv}\n"
+        fi
+      done < <(get_outbound_servers "$out_tag")
+    done <<< "$used_outbounds"
+    if [ -n "$dns_bootstrap_domains" ]; then
+      dns_bootstrap_domains="$(printf "%b" "$dns_bootstrap_domains" | awk '!seen[$0]++')"
+    fi
+  fi
 
   local inbound_count=0 outbound_count=0 endpoint_count=0 rule_count=0
   {
@@ -1980,6 +2019,16 @@ build_config() {
     echo '    ],'
     echo '    "rules": ['
     local dns_rule_count=0
+    if [ -n "$dns_bootstrap_domains" ]; then
+      while IFS= read -r domain; do
+        [ -z "$domain" ] && continue
+        if [ "$dns_rule_count" -gt 0 ]; then
+          echo '      ,'
+        fi
+        dns_rule_count=$((dns_rule_count+1))
+        echo "      { \"domain\": [\"$(json_escape "$domain")\"], \"server\": \"${dns_final}\" }"
+      done <<< "$dns_bootstrap_domains"
+    fi
     while IFS='|' read -r tag port out remark proto hy2_pass up down; do
       [ -z "$tag" ] && continue
       if [ "$dns_rule_count" -gt 0 ]; then
