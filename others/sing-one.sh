@@ -323,7 +323,8 @@ stop_singbox() {
 restart_singbox() {
   if systemd_available; then
     write_service
-    systemctl enable --now sing-box
+    systemctl enable sing-box >/dev/null 2>&1 || true
+    systemctl restart sing-box
   elif openrc_available; then
     write_openrc_service
     rc-service sing-box restart

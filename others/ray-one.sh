@@ -299,7 +299,8 @@ stop_xray() {
 
 restart_xray() {
   if systemd_available; then
-    systemctl enable --now xray
+    systemctl enable xray >/dev/null 2>&1 || true
+    systemctl restart xray
   elif openrc_available; then
     rc-service xray restart
   else
