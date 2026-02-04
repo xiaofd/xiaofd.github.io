@@ -52,6 +52,9 @@ export DHCP6_REASON=''
 export ConsoleForced='0'
 export DNSForced='0'
 export IPv6Forced='0'
+export IPv6_ADDR=''
+export IPv6_GW=''
+export IPv6_STATIC='0'
 
 while [[ $# -ge 1 ]]; do
   case $1 in
@@ -388,6 +391,22 @@ detect_auto_v6(){
   DHCP6_REASON="static"
 }
 
+detect_static_v6_details(){
+  IPv6_STATIC='0'
+  IPv6_ADDR=''
+  IPv6_GW=''
+  [[ "$HasIPv6" != "1" ]] && return 0
+  [[ "$UseDHCP6" == "1" ]] && return 0
+
+  IPv6_ADDR="$(ip -6 addr show dev "$interface" scope global 2>/dev/null | \
+    awk '/inet6/ && $2 !~ /^fe80/ && $0 !~ /temporary/ && $0 !~ /deprecated/ {print $2; exit}')"
+  IPv6_GW="$(ip -6 route show default dev "$interface" 2>/dev/null | awk '/default/ {print $3; exit}')"
+
+  if [[ -n "$IPv6_ADDR" ]] && [[ -n "$IPv6_GW" ]]; then
+    IPv6_STATIC='1'
+  fi
+}
+
 function selectMirror(){
   [ $# -ge 3 ] || exit 1
   Relese=$(echo "$1" |sed -r 's/(.*)/\L\1/')
@@ -542,6 +561,7 @@ if [[ "$setIPv6" == '0' ]] && [[ -n "$interface" ]]; then
   ip -6 addr show dev "$interface" scope global |grep -q 'inet6' && HasIPv6='1'
 fi
 detect_auto_v6
+detect_static_v6_details
 UseDHCP="$UseDHCP4"
 IPv4="$ipAddr"; MASK="$ipMask"; GATE="$ipGate";
 
@@ -1062,8 +1082,22 @@ d-i preseed/late_command string	\
 cp /target/etc/ssh/sshd_config /target/etc/ssh/sshd_config.old; \
 sed -i "s#^.*Port .*#Port ${sshPORT}#g" /target/etc/ssh/sshd_config; \
 sed -i 's/^.*PermitRootLogin.*/PermitRootLogin without-password/g' /target/etc/ssh/sshd_config; \
+sed -i 's/^.*PasswordAuthentication.*/PasswordAuthentication no/g' /target/etc/ssh/sshd_config; \
+grep -q '^PasswordAuthentication' /target/etc/ssh/sshd_config || echo 'PasswordAuthentication no' >>/target/etc/ssh/sshd_config; \
 mkdir -p /target/root/.ssh; \
 echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCfuo9/cfgAHy8HYEGVxY+wklHlnrAQ0bPsz6FcAahXQXqw7OdrBzFpkh4U0a7f/Ir0BVgzeYIdDIOL8Ow9Ko1UHldJRCFyy/9W8ji2MGF2YgOUMxmxrCOD1DeOOh04Xrjqx5kPxiscHDZIZEuUF6eM20h3HR+D4xN/3H0OYRkMAaUrSoR8QZVg5P5QSni+HOT6JPHfk7rocKnk/0aQbLPMhSCLjAP4iyM9Fhotn6ofjw9aJnxp/agjwvJPkYSCmC5LJY8Mrv3Xpl4/cjknN0NbxMLUEhXXPDvGnPdS+KSAfpoHDTpm2Zi/WuVtf7AUP0ao0OnWbiPpQcvlEzxXhAm88ipzlY8n4mUnkyR7wIn6nf8y3HeOo8RVwjXWxsc6hNh6gPmNMlJeJo9FGMDxmriX/dRaAqsoYMRtxW3TNxMkfLXKTGs3ykEb/H/WXirwAPpHnSxbCY9/JVvfQMYDctZO+bZ3NV6Nvv5d2ATjq+1FWWaIq6vNkgMQKqs4mxw5CZUGnx4Zd6DMM1VkfA4W3hiNedoFyhSaQWVucza2gdHT7MPDJxNV6TNJErjo6wiobHOXyWghop4UjO32MMhRWyKAhdn3iCIPUglLloEEpvYI0b/TTd5ZdobHAjh+smX9mlIJe3yaQSPlA4sp6MPOjGhC/r08u+6hkmjE1Ycmgw7W7Q== JuiceSSH" >/target/root/.ssh/authorized_keys; \
+if [ "$HasIPv6" = "1" ] && [ "$setIPv6" = "0" ]; then \
+  mkdir -p /target/etc/network/interfaces.d; \
+  if ! grep -qE "iface[[:space:]]+${interface}[[:space:]]+inet6" /target/etc/network/interfaces 2>/dev/null; then \
+    if [ "$IPv6_STATIC" = "1" ] && [ -n "$IPv6_ADDR" ] && [ -n "$IPv6_GW" ]; then \
+      printf "\niface %s inet6 static\n  address %s\n  gateway %s\n" "${interface}" "${IPv6_ADDR}" "${IPv6_GW}" >>/target/etc/network/interfaces; \
+    elif [ "$UseDHCP6" = "1" ]; then \
+      printf "\niface %s inet6 dhcp\n" "${interface}" >>/target/etc/network/interfaces; \
+    else \
+      printf "\niface %s inet6 auto\n" "${interface}" >>/target/etc/network/interfaces; \
+    fi; \
+  fi; \
+fi; \
 echo 'LANG="zh_CN.UTF-8"' >>/target/etc/environment; \
 echo 'LANGUAGE="zh_CN:zh:en_US:en"' >>/target/etc/environment; \
 echo '@reboot root mv /etc/run.sh /tmp/run.sh; rm -rf /etc/run.sh; sed -i /^@reboot/d /etc/crontab; bash /tmp/run.sh' >>/target/etc/crontab; \
