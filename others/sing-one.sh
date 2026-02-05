@@ -896,7 +896,7 @@ build_vless_outbound() {
     [ -z "$pbk" ] && die "Reality 出口需要 pbk。"
     [ -z "$sid" ] && die "Reality 出口需要 sid。"
     [ -z "$spx" ] && spx="/"
-    tls_block="\"tls\":{\"enabled\":true,\"server_name\":\"$(json_escape "$r_sni")\",\"reality\":{\"enabled\":true,\"public_key\":\"$(json_escape "$pbk")\",\"short_id\":\"$(json_escape "$sid")\",\"fingerprint\":\"$(json_escape "$r_fp")\",\"spider_x\":\"$(json_escape "$spx")\"}}"
+    tls_block="\"tls\":{\"enabled\":true,\"server_name\":\"$(json_escape "$r_sni")\",\"utls\":{\"enabled\":true,\"fingerprint\":\"$(json_escape "$r_fp")\"},\"reality\":{\"enabled\":true,\"public_key\":\"$(json_escape "$pbk")\",\"short_id\":\"$(json_escape "$sid")\",\"spider_x\":\"$(json_escape "$spx")\"}}"
   fi
 
   local transport_block=""
