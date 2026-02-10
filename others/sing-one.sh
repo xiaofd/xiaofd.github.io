@@ -24,6 +24,7 @@ SB_UNPACK_DIR="${TMP_DIR}/sing-box_unpack"
 WGCF_BIN="${TMP_DIR}/wgcf"
 WGCF_DST="/usr/local/bin/wgcf"
 WGCF_DIR="${TMP_DIR}/wgcf_work"
+ACME_BIN="/root/.acme.sh/acme.sh"
 DEFAULT_SNI="www.apple.com"
 HY2_CERT_MODE="self"
 HY2_DOMAIN=""
@@ -542,6 +543,19 @@ ensure_hy2_cert() {
   chmod 600 "$HY2_KEY"
 }
 
+ensure_acme_sh() {
+  if [ -x "$ACME_BIN" ]; then
+    return 0
+  fi
+  msg "安装 acme.sh..."
+  curl -fsSL https://get.acme.sh | sh >/dev/null 2>&1 || true
+  if [ ! -x "$ACME_BIN" ]; then
+    msg "检测到无 crontab 环境，尝试 --force 安装 acme.sh..."
+    curl -fsSL https://get.acme.sh | sh -s -- --force >/dev/null 2>&1 || true
+  fi
+  [ -x "$ACME_BIN" ] || die "acme.sh 安装失败，请检查网络或手动执行: curl -fsSL https://get.acme.sh | sh -s -- --force"
+}
+
 issue_hy2_acme_cert() {
   local domain token ip_choice ip_addr update_dns
   local cf_zone_id cf_zone_id_input cf_account_id cf_account_id_input
@@ -583,10 +597,7 @@ issue_hy2_acme_cert() {
       ;;
   esac
 
-  if [ ! -x /root/.acme.sh/acme.sh ]; then
-    msg "安装 acme.sh..."
-    curl -fsSL https://get.acme.sh | sh
-  fi
+  ensure_acme_sh
   export CF_Token="$token"
   if [ -n "$cf_zone_id" ]; then
     export CF_Zone_ID="$cf_zone_id"
@@ -594,14 +605,14 @@ issue_hy2_acme_cert() {
   if [ -n "$cf_account_id" ]; then
     export CF_Account_ID="$cf_account_id"
   fi
-  if ! /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$domain" --keylength 2048; then
+  if ! "$ACME_BIN" --issue --dns dns_cf -d "$domain" --keylength 2048; then
     if [ -z "$cf_zone_id" ] && [ -z "$cf_account_id" ]; then
       msg "首次申请失败，可填写 Zone ID 或 Account ID 后重试。"
       read -r -p "Cloudflare Zone ID(可选): " cf_zone_id_input
       read -r -p "Cloudflare Account ID(可选): " cf_account_id_input
       [ -n "$cf_zone_id_input" ] && export CF_Zone_ID="$cf_zone_id_input"
       [ -n "$cf_account_id_input" ] && export CF_Account_ID="$cf_account_id_input"
-      /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$domain" --keylength 2048 || die "申请证书失败。"
+      "$ACME_BIN" --issue --dns dns_cf -d "$domain" --keylength 2048 || die "申请证书失败。"
     else
       die "申请证书失败。"
     fi
@@ -609,7 +620,7 @@ issue_hy2_acme_cert() {
   unset CF_Token
   unset CF_Zone_ID
   unset CF_Account_ID
-  /root/.acme.sh/acme.sh --install-cert -d "$domain" \
+  "$ACME_BIN" --install-cert -d "$domain" \
     --key-file "$HY2_KEY" \
     --fullchain-file "$HY2_CERT" || die "安装证书失败。"
   chmod 600 "$HY2_KEY"
