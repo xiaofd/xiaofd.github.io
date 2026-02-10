@@ -27,10 +27,13 @@ WGCF_DIR="${TMP_DIR}/wgcf_work"
 DEFAULT_SNI="www.apple.com"
 HY2_CERT_MODE="self"
 HY2_DOMAIN=""
+DEFAULT_HY2_MASQUERADE="https://www.cloudflare.com"
 AUTO_PROTO=""
 SB_HAS_DNS_NEW=""
 SB_HAS_DOMAIN_RESOLVER=""
 SB_HAS_WG_NEW=""
+SB_HAS_HY2_MASQ=""
+SB_HAS_HY2_IGNORE_BW=""
 
 C_RESET=""
 C_BOLD=""
@@ -51,6 +54,22 @@ err() { printf '%s\n' "${C_RED}错误: $*${C_RESET}" >&2; }
 die() { err "$*"; exit 1; }
 
 cmd_exists() { command -v "$1" >/dev/null 2>&1; }
+version_ge() {
+  local a b
+  a="$(printf '%s' "$1" | sed 's/[^0-9.].*//')"
+  b="$(printf '%s' "$2" | sed 's/[^0-9.].*//')"
+  awk -v A="$a" -v B="$b" 'BEGIN{
+    split(A, a, ".");
+    split(B, b, ".");
+    for (i=1; i<=4; i++) {
+      ai = (a[i] == "" ? 0 : a[i]) + 0;
+      bi = (b[i] == "" ? 0 : b[i]) + 0;
+      if (ai > bi) exit 0;
+      if (ai < bi) exit 1;
+    }
+    exit 0;
+  }'
+}
 systemd_available() { cmd_exists systemctl && [ -d /run/systemd/system ]; }
 openrc_available() { cmd_exists rc-service && [ -d /etc/init.d ]; }
 ipv6_only() {
@@ -416,6 +435,46 @@ gen_hy2_password() {
   fi
 }
 
+gen_hy2_obfs_password() {
+  if cmd_exists openssl; then
+    openssl rand -base64 24 | tr -d '\n'
+  else
+    dd if=/dev/urandom bs=24 count=1 2>/dev/null | base64 | tr -d '\n'
+  fi
+}
+
+normalize_hy2_masquerade_url() {
+  local v
+  v="$(printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  [ -z "$v" ] && v="$DEFAULT_HY2_MASQUERADE"
+  if ! echo "$v" | grep -qiE '^(https?|file)://'; then
+    v="https://${v}"
+  fi
+  printf '%s\n' "$v"
+}
+
+prompt_hy2_hardening() {
+  local __obfs_var="$1" __masq_var="$2"
+  local ans obfs_pass masq
+  read -r -p "启用 HY2 混淆(obfs salamander，建议开启) [Y/n]: " ans
+  case "$ans" in
+    n|N)
+      obfs_pass=""
+      ;;
+    *)
+      read -r -p "HY2 混淆密码(留空自动生成): " obfs_pass
+      if [ -z "$obfs_pass" ]; then
+        obfs_pass="$(gen_hy2_obfs_password)"
+        msg "已生成 HY2 混淆密码: ${obfs_pass}"
+      fi
+      ;;
+  esac
+  read -r -p "HY2 伪装目标(抗探测，留空默认: ${DEFAULT_HY2_MASQUERADE}): " masq
+  masq="$(normalize_hy2_masquerade_url "$masq")"
+  printf -v "$__obfs_var" '%s' "$obfs_pass"
+  printf -v "$__masq_var" '%s' "$masq"
+}
+
 split_host_port() {
   local in="$1" host port
   IFS='|' read -r host port <<< "$(parse_hostport "$in")"
@@ -484,7 +543,7 @@ ensure_hy2_cert() {
 }
 
 issue_hy2_acme_cert() {
-  local domain token ip_choice ip_addr
+  local domain token ip_choice ip_addr update_dns cf_zone_id cf_zone_id_input
   domain="${HY2_DOMAIN:-}"
   if [ -z "$domain" ]; then
     read -r -p "HY2 证书域名(需解析到本机): " domain
@@ -495,21 +554,34 @@ issue_hy2_acme_cert() {
     read -r -p "Cloudflare Token (DNS): " token
   fi
   [ -z "$token" ] && die "CF Token 不能为空。"
+  cf_zone_id="${CF_Zone_ID:-}"
+  read -r -p "Cloudflare Zone ID(可选，Token 无法列出 Zone 时建议填写) [${cf_zone_id}]: " cf_zone_id_input
+  if [ -n "$cf_zone_id_input" ]; then
+    cf_zone_id="$cf_zone_id_input"
+  fi
 
-  ui "${C_BOLD}${C_BLUE}解析类型：${C_RESET}"
-  ui "  ${C_YELLOW}1)${C_RESET} IPv4 (A 记录，默认)"
-  ui "  ${C_YELLOW}2)${C_RESET} IPv6 (AAAA 记录)"
-  read -r -p "请选择 [1-2]: " ip_choice
-  case "$ip_choice" in
-    2)
-      ip_addr="$(get_public_ip6)"
-      [ -z "$ip_addr" ] && die "未获取到 IPv6 公网地址。"
-      cf_upsert_dns_record "$domain" "AAAA" "$ip_addr" "$token"
+  read -r -p "是否自动更新 ${domain} 解析到本机? [y/N]: " update_dns
+  case "$update_dns" in
+    y|Y)
+      ui "${C_BOLD}${C_BLUE}解析类型：${C_RESET}"
+      ui "  ${C_YELLOW}1)${C_RESET} IPv4 (A 记录，默认)"
+      ui "  ${C_YELLOW}2)${C_RESET} IPv6 (AAAA 记录)"
+      read -r -p "请选择 [1-2]: " ip_choice
+      case "$ip_choice" in
+        2)
+          ip_addr="$(get_public_ip6)"
+          [ -z "$ip_addr" ] && die "未获取到 IPv6 公网地址。"
+          cf_upsert_dns_record "$domain" "AAAA" "$ip_addr" "$token" "$cf_zone_id"
+          ;;
+        *)
+          ip_addr="$(get_public_ip4)"
+          [ -z "$ip_addr" ] && die "未获取到 IPv4 公网地址。"
+          cf_upsert_dns_record "$domain" "A" "$ip_addr" "$token" "$cf_zone_id"
+          ;;
+      esac
       ;;
     *)
-      ip_addr="$(get_public_ip4)"
-      [ -z "$ip_addr" ] && die "未获取到 IPv4 公网地址。"
-      cf_upsert_dns_record "$domain" "A" "$ip_addr" "$token"
+      msg "跳过 A/AAAA 解析更新，直接使用 Cloudflare DNS API 申请证书。"
       ;;
   esac
 
@@ -518,8 +590,12 @@ issue_hy2_acme_cert() {
     curl -fsSL https://get.acme.sh | sh
   fi
   export CF_Token="$token"
+  if [ -n "$cf_zone_id" ]; then
+    export CF_Zone_ID="$cf_zone_id"
+  fi
   /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$domain" --keylength 2048 || die "申请证书失败。"
   unset CF_Token
+  unset CF_Zone_ID
   /root/.acme.sh/acme.sh --install-cert -d "$domain" \
     --key-file "$HY2_KEY" \
     --fullchain-file "$HY2_CERT" || die "安装证书失败。"
@@ -530,25 +606,42 @@ issue_hy2_acme_cert() {
   msg "证书已签发并安装: ${domain}"
 }
 
+cf_api_error_message() {
+  local resp="$1" msg code
+  msg="$(echo "$resp" | sed -n 's/.*"message":"\([^"]\+\)".*/\1/p' | head -n1)"
+  code="$(echo "$resp" | sed -n 's/.*"code":\([0-9]\+\).*/\1/p' | head -n1)"
+  if [ -n "$msg" ] || [ -n "$code" ]; then
+    printf '%s\n' "code=${code:-N/A}, message=${msg:-unknown}"
+    return 0
+  fi
+  printf '%s\n' "unknown error"
+}
+
 cf_upsert_dns_record() {
-  local full_domain="$1" record_type="$2" ip_addr="$3" token="$4"
+  local full_domain="$1" record_type="$2" ip_addr="$3" token="$4" zone_id_in="${5:-}"
   local zone_name zone_id record_id payload resp
-  zone_name="$(cf_find_zone "$full_domain" "$token")"
-  [ -z "$zone_name" ] && die "未找到域名对应的 Zone，请检查域名是否在 Cloudflare。"
-  zone_id="$(cf_get_zone_id "$zone_name" "$token")"
-  [ -z "$zone_id" ] && die "未获取到 Zone ID，请检查 Token 权限。"
+  if [ -n "$zone_id_in" ]; then
+    zone_id="$zone_id_in"
+  else
+    zone_name="$(cf_find_zone "$full_domain" "$token")"
+    [ -z "$zone_name" ] && die "未找到域名对应的 Zone，请检查域名是否在 Cloudflare。"
+    zone_id="$(cf_get_zone_id "$zone_name" "$token")"
+    [ -z "$zone_id" ] && die "未获取到 Zone ID，请检查 Token 权限。"
+  fi
   record_id="$(cf_get_record_id "$zone_id" "$record_type" "$full_domain" "$token")"
   payload="{\"type\":\"${record_type}\",\"name\":\"${full_domain}\",\"content\":\"${ip_addr}\",\"ttl\":120,\"proxied\":false}"
   if [ -n "$record_id" ]; then
-    resp="$(curl -fsSL -X PUT "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${record_id}" \
+    resp="$(curl -sS -X PUT "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${record_id}" \
       -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
       --data "$payload" || true)"
   else
-    resp="$(curl -fsSL -X POST "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
+    resp="$(curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
       -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
       --data "$payload" || true)"
   fi
-  echo "$resp" | grep -q '"success":true' || die "Cloudflare DNS 记录设置失败。"
+  if ! echo "$resp" | grep -q '"success":true'; then
+    die "Cloudflare DNS 记录设置失败: $(cf_api_error_message "$resp")"
+  fi
   msg "DNS 记录已更新: ${full_domain} -> ${ip_addr}"
 }
 
@@ -571,12 +664,12 @@ cf_find_zone() {
 
 cf_get_zone_id() {
   local zone_name="$1" token="$2" resp zone_id
-  resp="$(curl -fsSL -G "https://api.cloudflare.com/client/v4/zones" \
+  resp="$(curl -sS -G "https://api.cloudflare.com/client/v4/zones" \
     -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
     --data-urlencode "name=${zone_name}" --data-urlencode "status=active" || true)"
   zone_id="$(echo "$resp" | sed -n 's/.*"id":"\([a-f0-9]\{32\}\)".*/\1/p' | head -n1)"
   if [ -z "$zone_id" ]; then
-    resp="$(curl -fsSL -G "https://api.cloudflare.com/client/v4/zones" \
+    resp="$(curl -sS -G "https://api.cloudflare.com/client/v4/zones" \
       -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
       --data-urlencode "name=${zone_name}" || true)"
     zone_id="$(echo "$resp" | sed -n 's/.*"id":"\([a-f0-9]\{32\}\)".*/\1/p' | head -n1)"
@@ -590,7 +683,7 @@ cf_get_zone_id() {
 
 cf_get_record_id() {
   local zone_id="$1" record_type="$2" record_name="$3" token="$4" resp
-  resp="$(curl -fsSL -G "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
+  resp="$(curl -sS -G "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
     -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
     --data-urlencode "type=${record_type}" --data-urlencode "name=${record_name}" || true)"
   echo "$resp" | sed -n 's/.*"id":"\([a-f0-9]\{32\}\)".*/\1/p' | head -n1
@@ -867,12 +960,20 @@ detect_singbox_features() {
   SB_HAS_DNS_NEW=1
   SB_HAS_DOMAIN_RESOLVER=1
   SB_HAS_WG_NEW=1
+  SB_HAS_HY2_MASQ=1
+  SB_HAS_HY2_IGNORE_BW=1
 
   if [ ! -x "$SB_BIN" ]; then
     return 0
   fi
 
-  local t
+  local t sb_version
+  sb_version="$("$SB_BIN" version 2>/dev/null | sed -n 's/^sing-box version \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+  if [ -n "$sb_version" ] && ! version_ge "$sb_version" "1.11.0"; then
+    SB_HAS_HY2_MASQ=0
+    SB_HAS_HY2_IGNORE_BW=0
+  fi
+
   t="$(tmp_path sb_feature.json)"
   cat > "$t" <<'EOF'
 {
@@ -1977,10 +2078,12 @@ next_inbound_tag() {
 }
 
 add_inbound() {
-  local port out_tag tag remark proto hy2_pass up down choice
+  local port out_tag tag remark proto hy2_pass up down choice hy2_obfs hy2_masq
   hy2_pass=""
   up=""
   down=""
+  hy2_obfs=""
+  hy2_masq=""
   port="$(prompt_port)"
   out_tag="$(choose_outbound)"
   if ! echo "$out_tag" | grep -qE '^[A-Za-z0-9_]+$'; then
@@ -2029,6 +2132,7 @@ add_inbound() {
     fi
     read -r -p "HY2 上行带宽(Mbps，可留空): " up
     read -r -p "HY2 下行带宽(Mbps，可留空): " down
+    prompt_hy2_hardening hy2_obfs hy2_masq
   fi
   if [ "$proto" = "hy2" ]; then
     read -r -p "别名(用于分享链接，留空默认 hy2-${port}): " remark
@@ -2043,7 +2147,7 @@ add_inbound() {
     fi
   fi
   tag="$(next_inbound_tag)"
-  echo "${tag}|${port}|${out_tag}|${remark}|${proto}|${hy2_pass}|${up}|${down}" >> "$INBOUNDS_FILE"
+  echo "${tag}|${port}|${out_tag}|${remark}|${proto}|${hy2_pass}|${up}|${down}|${hy2_obfs}|${hy2_masq}" >> "$INBOUNDS_FILE"
   msg "入口配置完成，正在生成配置并重启..."
   if ! build_config; then
     err "生成配置失败，请检查配置输入。"
@@ -2060,7 +2164,7 @@ sanitize_inbounds() {
   [ -f "$INBOUNDS_FILE" ] || return 0
   tmp="$(tmp_path inbounds.list)"
   > "$tmp"
-  while IFS='|' read -r tag port out remark proto hy2_pass up down; do
+  while IFS='|' read -r tag port out remark proto hy2_pass up down hy2_obfs hy2_masq; do
     [ -z "$tag" ] && continue
     if ! echo "$tag" | grep -qE '^[A-Za-z0-9_]+$'; then
       continue
@@ -2075,7 +2179,16 @@ sanitize_inbounds() {
       continue
     fi
     [ -z "$proto" ] && proto="vless"
-    echo "${tag}|${port}|${out}|${remark}|${proto}|${hy2_pass}|${up}|${down}" >> "$tmp"
+    if [ "$proto" = "hy2" ]; then
+      [ -z "$hy2_masq" ] && hy2_masq="$(normalize_hy2_masquerade_url "")"
+    else
+      hy2_pass=""
+      up=""
+      down=""
+      hy2_obfs=""
+      hy2_masq=""
+    fi
+    echo "${tag}|${port}|${out}|${remark}|${proto}|${hy2_pass}|${up}|${down}|${hy2_obfs}|${hy2_masq}" >> "$tmp"
   done < "$INBOUNDS_FILE"
   mv "$tmp" "$INBOUNDS_FILE"
 }
@@ -2087,7 +2200,7 @@ list_inbounds() {
     ui "暂无入口。"
     return 1
   fi
-  while IFS='|' read -r tag port out remark proto hy2_pass up down; do
+  while IFS='|' read -r tag port out remark proto hy2_pass up down hy2_obfs hy2_masq; do
     [ -z "$tag" ] && continue
     i=$((i+1))
     [ -z "$proto" ] && proto="vless"
@@ -2114,31 +2227,31 @@ update_inbound_line() {
   tmp="$(tmp_path inbounds.list)"
   : > "$tmp"
   local i=0
-  while IFS='|' read -r tag port out remark proto hy2_pass up down; do
+  while IFS='|' read -r tag port out remark proto hy2_pass up down hy2_obfs hy2_masq; do
     [ -z "$tag" ] && continue
     i=$((i+1))
     if [ "$i" -eq "$idx" ]; then
-      echo "${tag}|${new_port:-$port}|${new_out:-$out}|${remark}|${proto}|${hy2_pass}|${up}|${down}" >> "$tmp"
+      echo "${tag}|${new_port:-$port}|${new_out:-$out}|${remark}|${proto}|${hy2_pass}|${up}|${down}|${hy2_obfs}|${hy2_masq}" >> "$tmp"
     else
-      echo "${tag}|${port}|${out}|${remark}|${proto}|${hy2_pass}|${up}|${down}" >> "$tmp"
+      echo "${tag}|${port}|${out}|${remark}|${proto}|${hy2_pass}|${up}|${down}|${hy2_obfs}|${hy2_masq}" >> "$tmp"
     fi
   done < "$INBOUNDS_FILE"
   mv "$tmp" "$INBOUNDS_FILE"
 }
 
 update_inbound_proto_line() {
-  local idx="$1" new_proto="$2" new_pass="$3" new_up="$4" new_down="$5"
+  local idx="$1" new_proto="$2" new_pass="$3" new_up="$4" new_down="$5" new_obfs="$6" new_masq="$7"
   local tmp
   tmp="$(tmp_path inbounds.list)"
   : > "$tmp"
   local i=0
-  while IFS='|' read -r tag port out remark proto hy2_pass up down; do
+  while IFS='|' read -r tag port out remark proto hy2_pass up down hy2_obfs hy2_masq; do
     [ -z "$tag" ] && continue
     i=$((i+1))
     if [ "$i" -eq "$idx" ]; then
-      echo "${tag}|${port}|${out}|${remark}|${new_proto:-$proto}|${new_pass}|${new_up}|${new_down}" >> "$tmp"
+      echo "${tag}|${port}|${out}|${remark}|${new_proto:-$proto}|${new_pass}|${new_up}|${new_down}|${new_obfs}|${new_masq}" >> "$tmp"
     else
-      echo "${tag}|${port}|${out}|${remark}|${proto}|${hy2_pass}|${up}|${down}" >> "$tmp"
+      echo "${tag}|${port}|${out}|${remark}|${proto}|${hy2_pass}|${up}|${down}|${hy2_obfs}|${hy2_masq}" >> "$tmp"
     fi
   done < "$INBOUNDS_FILE"
   mv "$tmp" "$INBOUNDS_FILE"
@@ -2150,11 +2263,11 @@ remove_inbound_line() {
   tmp="$(tmp_path inbounds.list)"
   : > "$tmp"
   local i=0
-  while IFS='|' read -r tag port out remark proto hy2_pass up down; do
+  while IFS='|' read -r tag port out remark proto hy2_pass up down hy2_obfs hy2_masq; do
     [ -z "$tag" ] && continue
     i=$((i+1))
     if [ "$i" -ne "$idx" ]; then
-      echo "${tag}|${port}|${out}|${remark}|${proto}|${hy2_pass}|${up}|${down}" >> "$tmp"
+      echo "${tag}|${port}|${out}|${remark}|${proto}|${hy2_pass}|${up}|${down}|${hy2_obfs}|${hy2_masq}" >> "$tmp"
     fi
   done < "$INBOUNDS_FILE"
   mv "$tmp" "$INBOUNDS_FILE"
@@ -2182,7 +2295,7 @@ change_outbound() {
 }
 
 change_protocol() {
-  local idx proto choice hy2_pass up down
+  local idx proto choice hy2_pass up down hy2_obfs hy2_masq
   idx="$(select_inbound_index)" || return 0
   ui "${C_BOLD}${C_BLUE}入口协议：${C_RESET}"
   ui "  ${C_YELLOW}1)${C_RESET} VLESS Reality (TCP)"
@@ -2192,6 +2305,11 @@ change_protocol() {
     2) proto="hy2" ;;
     *) proto="vless" ;;
   esac
+  hy2_pass=""
+  up=""
+  down=""
+  hy2_obfs=""
+  hy2_masq=""
   if [ "$proto" = "hy2" ]; then
     load_manager_conf
     ui "${C_BOLD}${C_BLUE}HY2 证书类型：${C_RESET}"
@@ -2215,8 +2333,9 @@ change_protocol() {
     fi
     read -r -p "HY2 上行带宽(Mbps，可留空): " up
     read -r -p "HY2 下行带宽(Mbps，可留空): " down
+    prompt_hy2_hardening hy2_obfs hy2_masq
   fi
-  update_inbound_proto_line "$idx" "$proto" "$hy2_pass" "$up" "$down"
+  update_inbound_proto_line "$idx" "$proto" "$hy2_pass" "$up" "$down" "$hy2_obfs" "$hy2_masq"
   build_config
   restart_singbox
   msg "协议已更新。"
@@ -2257,7 +2376,7 @@ build_config() {
   IFS='|' read -r dest_host dest_port <<< "$(split_host_port "$DEST")"
 
   local hy2_needed=0
-  while IFS='|' read -r tag port out remark proto hy2_pass up down; do
+  while IFS='|' read -r tag port out remark proto hy2_pass up down hy2_obfs hy2_masq; do
     [ -z "$tag" ] && continue
     [ -z "$proto" ] && proto="vless"
     if [ "$proto" = "hy2" ]; then
@@ -2332,7 +2451,7 @@ build_config() {
     echo "    \"strategy\": \"${dns_strategy}\""
     echo '  },'
     echo '  "inbounds": ['
-    while IFS='|' read -r tag port out remark proto hy2_pass up down; do
+    while IFS='|' read -r tag port out remark proto hy2_pass up down hy2_obfs hy2_masq; do
       [ -z "$tag" ] && continue
       [ -z "$proto" ] && proto="vless"
       inbound_count=$((inbound_count+1))
@@ -2358,7 +2477,7 @@ build_config() {
         "alpn": ["h3"],
         "certificate_path": "$(json_escape "$HY2_CERT")",
         "key_path": "$(json_escape "$HY2_KEY")"
-      }$( [ -n "$up" ] && printf ',\n      "up_mbps": %s' "$up" )$( [ -n "$down" ] && printf ',\n      "down_mbps": %s' "$down" )
+      }$( [ -n "$up" ] && printf ',\n      "up_mbps": %s' "$up" )$( [ -n "$down" ] && printf ',\n      "down_mbps": %s' "$down" )$( [ -z "$up" ] && [ -z "$down" ] && [ "${SB_HAS_HY2_IGNORE_BW}" -eq 1 ] && printf ',\n      "ignore_client_bandwidth": true' )$( [ -n "$hy2_obfs" ] && printf ',\n      "obfs": {"type":"salamander","password":"%s"}' "$(json_escape "$hy2_obfs")" )$( [ -n "$hy2_masq" ] && [ "${SB_HAS_HY2_MASQ}" -eq 1 ] && printf ',\n      "masquerade": "%s"' "$(json_escape "$hy2_masq")" )
     }
 EOF
       else
@@ -2449,7 +2568,7 @@ EOF
     echo '  "route": {'
     echo '    "auto_detect_interface": true,'
     echo '    "rules": ['
-    while IFS='|' read -r tag port out remark proto hy2_pass up down; do
+    while IFS='|' read -r tag port out remark proto hy2_pass up down hy2_obfs hy2_masq; do
       [ -z "$tag" ] && continue
       if [ ! -f "${OUTBOUNDS_DIR}/${out}.json" ] && [ ! -f "${ENDPOINTS_DIR}/${out}.json" ]; then
         die "未找到出口: ${out}"
@@ -2524,7 +2643,7 @@ show_info() {
   fi
 
   msg "入口列表："
-  while IFS='|' read -r tag port out remark proto hy2_pass up down; do
+  while IFS='|' read -r tag port out remark proto hy2_pass up down hy2_obfs hy2_masq; do
     [ -z "$tag" ] && continue
     local alias frag
     alias="${remark:-$tag}"
@@ -2533,7 +2652,7 @@ show_info() {
     [ -z "${proto:-}" ] && proto="vless"
     hy2_pass="${hy2_pass:-}"
     if [ "$proto" = "hy2" ]; then
-      local insecure_q="" sni_name
+      local insecure_q="" obfs_q="" sni_name
       local hy2_pass_enc
       sni_name="${SERVER_NAME}"
       if [ "${HY2_CERT_MODE:-self}" = "acme" ] && [ -n "${HY2_DOMAIN:-}" ]; then
@@ -2547,17 +2666,20 @@ show_info() {
         continue
       fi
       hy2_pass_enc="$(urlencode "$hy2_pass")"
+      if [ -n "$hy2_obfs" ]; then
+        obfs_q="&obfs=salamander&obfs-password=$(urlencode "$hy2_obfs")"
+      fi
       if [ "$have_share" -eq 1 ]; then
-        msg "  hysteria2://${hy2_pass_enc}@${host}:${port}?sni=${sni_name}&alpn=h3${insecure_q}#${frag}"
+        msg "  hysteria2://${hy2_pass_enc}@${host}:${port}?sni=${sni_name}&alpn=h3${insecure_q}${obfs_q}#${frag}"
       else
         if [ -n "$host4" ]; then
-          msg "  hysteria2://${hy2_pass_enc}@${host4}:${port}?sni=${sni_name}&alpn=h3${insecure_q}#${frag}"
+          msg "  hysteria2://${hy2_pass_enc}@${host4}:${port}?sni=${sni_name}&alpn=h3${insecure_q}${obfs_q}#${frag}"
         fi
         if [ -n "$host6" ]; then
-          msg "  hysteria2://${hy2_pass_enc}@[${host6}]:${port}?sni=${sni_name}&alpn=h3${insecure_q}#${frag}"
+          msg "  hysteria2://${hy2_pass_enc}@[${host6}]:${port}?sni=${sni_name}&alpn=h3${insecure_q}${obfs_q}#${frag}"
         fi
         if [ -z "$host4" ] && [ -z "$host6" ]; then
-          msg "  hysteria2://${hy2_pass_enc}@SERVER_IP:${port}?sni=${sni_name}&alpn=h3${insecure_q}#${frag}"
+          msg "  hysteria2://${hy2_pass_enc}@SERVER_IP:${port}?sni=${sni_name}&alpn=h3${insecure_q}${obfs_q}#${frag}"
         fi
       fi
     else
