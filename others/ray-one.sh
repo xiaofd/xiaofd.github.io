@@ -1599,6 +1599,9 @@ next_inbound_tag() {
 
 add_inbound() {
   local port out_tag tag remark
+  if [ ! -f "$MANAGER_CONF" ]; then
+    init_base_config
+  fi
   port="$(prompt_port)"
   out_tag="$(choose_outbound)"
   if ! echo "$out_tag" | grep -qE '^[A-Za-z0-9_]+$'; then
@@ -1718,6 +1721,10 @@ change_outbound() {
   restart_xray
   test_outbound "$new_out"
   msg "出口已更新。"
+}
+
+change_protocol() {
+  msg "Xray 当前仅支持 VLESS Reality (TCP)，暂无可切换协议。"
 }
 
 remove_inbound() {
@@ -1885,51 +1892,6 @@ get_public_ip6() {
   curl -6 -fsSL --max-time 6 https://api64.ipify.org 2>/dev/null || true
 }
 
-show_info() {
-  load_manager_conf
-  local host4 host6 host link_host
-  link_host=""
-  if [ -n "${SHARE_HOST:-}" ]; then
-    link_host="$SHARE_HOST"
-  else
-    host4="$(get_public_ip4)"
-    host6="$(get_public_ip6)"
-  fi
-
-  msg "Reality 参数："
-  msg "  UUID: ${UUID}"
-  msg "  公钥: ${PUBLIC_KEY}"
-  msg "  ShortID: ${SHORT_ID}"
-  msg "  SNI: ${SERVER_NAME}"
-  msg "  目标: ${DEST}"
-
-  if [ -n "$link_host" ]; then
-    host="$link_host"
-  fi
-
-  msg "入口列表："
-  while IFS='|' read -r tag port out remark; do
-    [ -z "$tag" ] && continue
-    local alias frag
-    alias="${remark:-$tag}"
-    frag="$(urlencode "$alias")"
-    msg "  ${tag}  端口=${port}  出口=${out}"
-    if [ -n "$link_host" ]; then
-      msg "  vless://${UUID}@${host}:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
-    else
-      if [ -n "$host4" ]; then
-        msg "  vless://${UUID}@${host4}:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
-      fi
-      if [ -n "$host6" ]; then
-        msg "  vless://${UUID}@[${host6}]:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
-      fi
-      if [ -z "$host4" ] && [ -z "$host6" ]; then
-        msg "  vless://${UUID}@SERVER_IP:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
-      fi
-    fi
-  done < "$INBOUNDS_FILE"
-}
-
 update_base_config() {
   load_manager_conf
   local ans
@@ -1956,6 +1918,24 @@ update_base_config() {
   msg "基础配置已更新。"
 }
 
+init_base_config() {
+  need_root
+  ensure_dirs
+  UUID="$(gen_uuid)"
+  SHORT_ID="$(gen_short_id)"
+  FINGERPRINT="chrome"
+  gen_reality_keys
+
+  read -r -p "Reality SNI(建议常见 TLS 域名，默认: ${DEFAULT_SNI}): " SERVER_NAME
+  SERVER_NAME="${SERVER_NAME:-${DEFAULT_SNI}}"
+  read -r -p "Reality 目标(默认: ${SERVER_NAME}:443): " DEST
+  DEST="${DEST:-${SERVER_NAME}:443}"
+  read -r -p "分享地址(域名或IP，留空自动获取): " SHARE_HOST
+
+  save_manager_conf
+  > "$INBOUNDS_FILE"
+}
+
 install_flow() {
   need_root
   install_deps
@@ -1966,26 +1946,8 @@ install_flow() {
   write_openrc_service
   setup_logrotate
 
-  UUID="$(gen_uuid)"
-  SHORT_ID="$(gen_short_id)"
-  FINGERPRINT="chrome"
-  gen_reality_keys
-
-  read -r -p "Reality SNI(建议填常见 TLS 域名，默认: ${DEFAULT_SNI}): " SERVER_NAME
-  SERVER_NAME="${SERVER_NAME:-${DEFAULT_SNI}}"
-  read -r -p "Reality 目标(默认: ${SERVER_NAME}:443): " DEST
-  DEST="${DEST:-${SERVER_NAME}:443}"
-  read -r -p "分享地址(域名或IP，留空自动获取): " SHARE_HOST
-
-  save_manager_conf
-  > "$INBOUNDS_FILE"
-
-  msg "添加首个入口："
-  add_inbound
-
-  build_config
-  start_xray
-  show_info
+  msg "安装完成。"
+  msg "请在菜单中新增入口。"
 }
 
 uninstall_all() {
@@ -2055,6 +2017,62 @@ show_status() {
   fi
 }
 
+show_info() {
+  if [ ! -f "$MANAGER_CONF" ]; then
+    msg "未初始化，请先新增入口或更新基础配置。"
+    return 0
+  fi
+  load_manager_conf
+  local host4 host6 host link_host have_share
+  link_host=""
+  have_share=0
+  if [ -n "${SHARE_HOST:-}" ]; then
+    link_host="$SHARE_HOST"
+    have_share=1
+  else
+    host4="$(get_public_ip4)"
+    host6="$(get_public_ip6)"
+  fi
+
+  msg "Reality 参数："
+  msg "  UUID: ${UUID}"
+  msg "  公钥: ${PUBLIC_KEY}"
+  msg "  ShortID: ${SHORT_ID}"
+  msg "  SNI: ${SERVER_NAME}"
+  msg "  目标: ${DEST}"
+
+  if [ ! -f "$INBOUNDS_FILE" ] || [ ! -s "$INBOUNDS_FILE" ]; then
+    msg "入口列表：暂无入口。"
+    return 0
+  fi
+
+  if [ "$have_share" -eq 1 ]; then
+    host="$link_host"
+  fi
+
+  msg "入口列表："
+  while IFS='|' read -r tag port out remark; do
+    [ -z "$tag" ] && continue
+    local alias frag
+    alias="${remark:-$tag}"
+    frag="$(urlencode "$alias")"
+    msg "  ${tag}  端口=${port}  出口=${out}"
+    if [ "$have_share" -eq 1 ]; then
+      msg "  vless://${UUID}@${host}:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
+    else
+      if [ -n "$host4" ]; then
+        msg "  vless://${UUID}@${host4}:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
+      fi
+      if [ -n "$host6" ]; then
+        msg "  vless://${UUID}@[${host6}]:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
+      fi
+      if [ -z "$host4" ] && [ -z "$host6" ]; then
+        msg "  vless://${UUID}@SERVER_IP:${port}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${frag}"
+      fi
+    fi
+  done < "$INBOUNDS_FILE"
+}
+
 restart_service() {
   restart_xray
   msg "服务已重启。"
@@ -2068,32 +2086,38 @@ main_menu() {
     menu_title "Xray Reality 一键脚本"
     msg "${C_DIM}(${OS_NAME} ${OS_VERSION} / ${ARCH_LABEL})${C_RESET}"
     menu_sep
-    if [ -f "$MANAGER_CONF" ] && [ -x "$XRAY_BIN" ]; then
+    if [ -x "$XRAY_BIN" ]; then
       sanitize_inbounds
       setup_logrotate
       menu_item 1 "新增入口"
       menu_item 2 "修改入口端口"
-      menu_item 3 "修改入口出口"
-      menu_item 4 "自定义出口管理"
-      menu_item 5 "删除入口"
-      menu_item 6 "更新基础配置(SNI/UUID/密钥)"
-      menu_item 7 "显示连接信息"
-      menu_item 8 "查看运行状态"
-      menu_item 9 "重启服务"
-      menu_item 10 "卸载"
+      menu_item 3 "修改入口协议"
+      menu_item 4 "修改入口出口"
+      menu_item 5 "自定义出口管理"
+      menu_item 6 "删除入口"
+      menu_item 7 "更新基础配置(SNI/UUID/密钥)"
+      menu_item 8 "显示连接信息"
+      menu_item 9 "查看运行状态"
+      menu_item 10 "重启服务"
+      menu_item 11 "卸载"
       menu_item 0 "退出"
       read -r -p "请选择: " choice
+      if [ ! -f "$MANAGER_CONF" ] && [ "$choice" != "1" ] && [ "$choice" != "0" ] && [ "$choice" != "11" ]; then
+        msg "请先通过“新增入口”初始化基础配置。"
+        continue
+      fi
       case "$choice" in
         1) add_inbound ;;
         2) change_port ;;
-        3) change_outbound ;;
-        4) manage_custom_outbounds ;;
-        5) remove_inbound ;;
-        6) update_base_config ;;
-        7) show_info ;;
-        8) show_status ;;
-        9) restart_service ;;
-        10) uninstall_all ;;
+        3) change_protocol ;;
+        4) change_outbound ;;
+        5) manage_custom_outbounds ;;
+        6) remove_inbound ;;
+        7) update_base_config ;;
+        8) show_info ;;
+        9) show_status ;;
+        10) restart_service ;;
+        11) uninstall_all ;;
         0) exit 0 ;;
       esac
     else
