@@ -2658,6 +2658,10 @@ uninstall_all() {
   rm -rf "$CONFIG_DIR"
   rm -f "$SB_BIN"
   rm -f "$LOGROTATE_FILE"
+  rm -f "$PID_FILE"
+  rm -f "$WGCF_DST"
+  rm -rf /var/log/sing-box
+  rm -rf "$TMP_DIR"
   msg "已卸载。"
 }
 

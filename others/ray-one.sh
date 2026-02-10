@@ -2008,6 +2008,11 @@ uninstall_all() {
   rm -rf "$CONFIG_DIR"
   rm -f "$XRAY_BIN"
   rm -f "$LOGROTATE_FILE"
+  rm -f "$PID_FILE"
+  rm -f "$WGCF_DST"
+  rm -rf /var/log/xray
+  rm -rf /usr/local/share/xray
+  rm -rf "$TMP_DIR"
   msg "已卸载。"
 }
 
