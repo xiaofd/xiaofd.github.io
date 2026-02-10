@@ -190,11 +190,11 @@ install_deps() {
   ensure_tmp_dir
   if is_alpine; then
     cmd_exists apk || die "未找到 apk，无法安装依赖。"
-    apk add --no-cache curl ca-certificates logrotate openssl
+    apk add --no-cache curl ca-certificates logrotate openssl cronie
     return 0
   fi
   apt-get update -y
-  apt-get install -y curl ca-certificates logrotate openssl
+  apt-get install -y curl ca-certificates logrotate openssl cron
 }
 
 detect_arch_singbox() {
@@ -543,7 +543,32 @@ ensure_hy2_cert() {
   chmod 600 "$HY2_KEY"
 }
 
+ensure_cron_dependency() {
+  if cmd_exists crontab; then
+    return 0
+  fi
+  msg "安装 cron 依赖中..."
+  if is_alpine; then
+    apk add --no-cache cronie >/dev/null 2>&1 || true
+  else
+    apt-get update -y >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y cron >/dev/null 2>&1 || true
+  fi
+  if ! cmd_exists crontab; then
+    ui "未检测到 crontab，将继续使用 acme.sh --force 安装模式。"
+    return 1
+  fi
+  if systemd_available; then
+    systemctl enable --now cron >/dev/null 2>&1 || systemctl enable --now crond >/dev/null 2>&1 || true
+  elif openrc_available; then
+    rc-update add crond default >/dev/null 2>&1 || true
+    rc-service crond start >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
 ensure_acme_sh() {
+  ensure_cron_dependency || true
   if [ -x "$ACME_BIN" ]; then
     return 0
   fi
@@ -554,6 +579,7 @@ ensure_acme_sh() {
     curl -fsSL https://get.acme.sh | sh -s -- --force >/dev/null 2>&1 || true
   fi
   [ -x "$ACME_BIN" ] || die "acme.sh 安装失败，请检查网络或手动执行: curl -fsSL https://get.acme.sh | sh -s -- --force"
+  "$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
 }
 
 issue_hy2_acme_cert() {
@@ -605,14 +631,14 @@ issue_hy2_acme_cert() {
   if [ -n "$cf_account_id" ]; then
     export CF_Account_ID="$cf_account_id"
   fi
-  if ! "$ACME_BIN" --issue --dns dns_cf -d "$domain" --keylength 2048; then
+  if ! "$ACME_BIN" --issue --dns dns_cf --server letsencrypt -d "$domain" --keylength 2048; then
     if [ -z "$cf_zone_id" ] && [ -z "$cf_account_id" ]; then
       msg "首次申请失败，可填写 Zone ID 或 Account ID 后重试。"
       read -r -p "Cloudflare Zone ID(可选): " cf_zone_id_input
       read -r -p "Cloudflare Account ID(可选): " cf_account_id_input
       [ -n "$cf_zone_id_input" ] && export CF_Zone_ID="$cf_zone_id_input"
       [ -n "$cf_account_id_input" ] && export CF_Account_ID="$cf_account_id_input"
-      "$ACME_BIN" --issue --dns dns_cf -d "$domain" --keylength 2048 || die "申请证书失败。"
+      "$ACME_BIN" --issue --dns dns_cf --server letsencrypt -d "$domain" --keylength 2048 || die "申请证书失败。"
     else
       die "申请证书失败。"
     fi
