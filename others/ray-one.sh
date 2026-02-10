@@ -570,6 +570,22 @@ json_array_from_csv() {
   echo "$csv" | tr ',' '\n' | awk 'BEGIN{printf "["} {gsub(/^[ \t]+|[ \t]+$/,""); if($0!=""){if(NR>1)printf ","; printf "\"%s\"", $0}} END{printf "]"}'
 }
 
+normalize_hy_rate() {
+  local v
+  v="$(printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  [ -z "$v" ] && return 0
+  if [ "$v" = "0" ]; then
+    echo "0"
+    return 0
+  fi
+  if echo "$v" | grep -qE '^[0-9]+([.][0-9]+)?$'; then
+    # hy2 links typically carry upmbps/downmbps as plain Mbps numbers.
+    echo "${v} mbps"
+    return 0
+  fi
+  echo "$v"
+}
+
 parse_hostport() {
   local in="$1" host="" port=""
   if echo "$in" | grep -q '^\['; then
@@ -1110,6 +1126,8 @@ build_hy2_outbound() {
   [ -z "$port" ] && die "HY2 缺少端口。"
   password="$(urldecode "$password")"
   [ -z "$password" ] && die "HY2 缺少密码。"
+  up="$(normalize_hy_rate "$up")"
+  down="$(normalize_hy_rate "$down")"
 
   local tls_items=""
   local tls_sni="${sni:-$host}"
@@ -1134,6 +1152,7 @@ build_hy2_outbound() {
   "tag": "${tag}",
   "protocol": "hysteria",
   "settings": {
+    "version": 2,
     "address": "${host}",
     "port": ${port}
   },
