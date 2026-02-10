@@ -1396,10 +1396,10 @@ get_wgcf_version() {
 
 setup_warp() {
   local ver arch url priv addr peer_pub endpoint mtu reserved addr4 addr6 res_json allowed allowed_json peer_reserved
-  if [ -f "${ENDPOINTS_DIR}/warp.json" ]; then
+  if [ -f "${OUTBOUNDS_DIR}/warp.json" ]; then
     return 0
   fi
-  rm -f "${OUTBOUNDS_DIR}/warp.json" >/dev/null 2>&1 || true
+  rm -f "${ENDPOINTS_DIR}/warp.json" >/dev/null 2>&1 || true
   ensure_dirs
   ensure_tmp_dir
   rm -rf "$WGCF_DIR"
@@ -1454,7 +1454,7 @@ setup_warp() {
     endpoint_port="2408"
   fi
 
-  cat > "${ENDPOINTS_DIR}/warp.json" <<EOF
+  cat > "${OUTBOUNDS_DIR}/warp.json" <<EOF
 {
   "type": "wireguard",
   "tag": "warp",
