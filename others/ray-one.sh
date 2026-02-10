@@ -622,6 +622,30 @@ is_ip_addr() {
   return 1
 }
 
+is_domain_name() {
+  local v="$1"
+  echo "$v" | grep -qiE '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+}
+
+normalize_domain_candidate() {
+  local v="$1"
+  [ -z "$v" ] && return 1
+  v="$(urldecode "$v" 2>/dev/null || printf '%s' "$v")"
+  v="$(printf '%s' "$v" | tr -d '\r')"
+  v="${v#http://}"
+  v="${v#https://}"
+  v="${v#*@}"
+  v="${v%%/*}"
+  v="${v%%\?*}"
+  v="${v%%#*}"
+  v="$(printf '%s' "$v" | sed 's/^\[//;s/\]$//;s/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if echo "$v" | grep -q ':' && ! echo "$v" | grep -qE '^[0-9a-fA-F:]+$'; then
+    v="${v%%:*}"
+  fi
+  [ -z "$v" ] && return 1
+  printf '%s\n' "$v"
+}
+
 get_outbound_domains() {
   local tag="$1" f
   if [ -f "${OUTBOUNDS_DIR}/${tag}.json" ]; then
@@ -639,6 +663,21 @@ get_outbound_domains() {
     sed -n 's/.*[?&]sni=\\([^&]*\\).*/\\1/p' "${OUTBOUNDS_DIR}/${tag}.link"
     sed -n 's/.*[?&]host=\\([^&]*\\).*/\\1/p' "${OUTBOUNDS_DIR}/${tag}.link"
   fi
+}
+
+validate_xray_config() {
+  [ -x "$XRAY_BIN" ] || return 0
+  local cfg check_log
+  cfg="${CONFIG_DIR}/config.json"
+  check_log="$(tmp_path xray_check.log)"
+  if "$XRAY_BIN" run -test -config "$cfg" >"$check_log" 2>&1 || "$XRAY_BIN" run -test -c "$cfg" >"$check_log" 2>&1; then
+    rm -f "$check_log"
+    return 0
+  fi
+  err "Xray 配置校验失败："
+  sed 's/^/  /' "$check_log" >&2 || true
+  rm -f "$check_log"
+  return 1
 }
 
 base64_decode() {
@@ -1762,9 +1801,12 @@ build_config() {
   if [ -n "$used_outbounds" ]; then
     while IFS= read -r out_tag; do
       [ -z "$out_tag" ] && continue
-      while IFS= read -r srv; do
+      while IFS= read -r raw_srv; do
+        local srv
+        [ -z "$raw_srv" ] && continue
+        srv="$(normalize_domain_candidate "$raw_srv" || true)"
         [ -z "$srv" ] && continue
-        if ! is_ip_addr "$srv"; then
+        if ! is_ip_addr "$srv" && is_domain_name "$srv"; then
           dns_bootstrap_domains="${dns_bootstrap_domains}${srv}\n"
         fi
       done < <(get_outbound_domains "$out_tag")
@@ -1882,6 +1924,7 @@ EOF
   } > "$tmp"
 
   mv "$tmp" "${CONFIG_DIR}/config.json"
+  validate_xray_config
 }
 
 get_public_ip4() {

@@ -750,6 +750,30 @@ is_ip_addr() {
   return 1
 }
 
+is_domain_name() {
+  local v="$1"
+  echo "$v" | grep -qiE '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+}
+
+normalize_domain_candidate() {
+  local v="$1"
+  [ -z "$v" ] && return 1
+  v="$(urldecode "$v" 2>/dev/null || printf '%s' "$v")"
+  v="$(printf '%s' "$v" | tr -d '\r')"
+  v="${v#http://}"
+  v="${v#https://}"
+  v="${v#*@}"
+  v="${v%%/*}"
+  v="${v%%\?*}"
+  v="${v%%#*}"
+  v="$(printf '%s' "$v" | sed 's/^\[//;s/\]$//;s/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if echo "$v" | grep -q ':' && ! echo "$v" | grep -qE '^[0-9a-fA-F:]+$'; then
+    v="${v%%:*}"
+  fi
+  [ -z "$v" ] && return 1
+  printf '%s\n' "$v"
+}
+
 get_outbound_domains() {
   local tag="$1" f
   if [ -f "${OUTBOUNDS_DIR}/${tag}.json" ]; then
@@ -804,16 +828,20 @@ EOF
     SB_HAS_DNS_NEW=0
   fi
 
-  cat > "$t" <<'EOF'
+  if [ "${SB_HAS_DNS_NEW}" -eq 1 ]; then
+    cat > "$t" <<'EOF'
 {
   "log": {"level":"warn"},
-  "dns": {"servers": ["https://1.1.1.1/dns-query"]},
+  "dns": {"servers": [{"tag":"dns_probe","type":"https","server":"1.1.1.1"}]},
   "outbounds": [
-    {"type":"direct","tag":"direct", "domain_resolver": {"server":"dns"}}
+    {"type":"direct","tag":"direct", "domain_resolver": {"server":"dns_probe","strategy":"prefer_ipv4"}}
   ]
 }
 EOF
-  if ! singbox_check_config "$t"; then
+    if ! singbox_check_config "$t"; then
+      SB_HAS_DOMAIN_RESOLVER=0
+    fi
+  else
     SB_HAS_DOMAIN_RESOLVER=0
   fi
 
@@ -836,6 +864,20 @@ EOF
   if ! singbox_check_config "$t"; then
     SB_HAS_WG_NEW=0
   fi
+}
+
+validate_singbox_config() {
+  [ -x "$SB_BIN" ] || return 0
+  local check_log
+  check_log="$(tmp_path singbox_check.log)"
+  if "$SB_BIN" check -c "${CONFIG_DIR}/config.json" >"$check_log" 2>&1; then
+    rm -f "$check_log"
+    return 0
+  fi
+  err "sing-box 配置校验失败："
+  sed 's/^/  /' "$check_log" >&2 || true
+  rm -f "$check_log"
+  return 1
 }
 
 emit_outbound_with_resolver() {
@@ -2091,9 +2133,12 @@ build_config() {
   if [ -n "$used_outbounds" ]; then
     while IFS= read -r out_tag; do
       [ -z "$out_tag" ] && continue
-      while IFS= read -r srv; do
+      while IFS= read -r raw_srv; do
+        local srv
+        [ -z "$raw_srv" ] && continue
+        srv="$(normalize_domain_candidate "$raw_srv" || true)"
         [ -z "$srv" ] && continue
-        if ! is_ip_addr "$srv"; then
+        if ! is_ip_addr "$srv" && is_domain_name "$srv"; then
           dns_bootstrap_domains="${dns_bootstrap_domains}${srv}\n"
         fi
       done < <(get_outbound_domains "$out_tag")
@@ -2119,11 +2164,11 @@ build_config() {
       echo '      { "tag": "dns_direct6_1", "type": "https", "server": "2606:4700:4700::1111", "detour": "direct6" },'
       echo '      { "tag": "dns_direct6_2", "type": "https", "server": "2001:4860:4860::8888", "detour": "direct6" }'
     else
-      echo '      "https://1.1.1.1/dns-query",'
-      echo '      "https://8.8.8.8/dns-query",'
-      echo '      "https://223.5.5.5/dns-query",'
-      echo '      "https://[2606:4700:4700::1111]/dns-query",'
-      echo '      "https://[2001:4860:4860::8888]/dns-query"'
+      echo '      { "tag": "dns_direct4_1", "address": "https://1.1.1.1/dns-query", "detour": "direct4" },'
+      echo '      { "tag": "dns_direct4_2", "address": "https://8.8.8.8/dns-query", "detour": "direct4" },'
+      echo '      { "tag": "dns_direct4_3", "address": "https://223.5.5.5/dns-query", "detour": "direct4" },'
+      echo '      { "tag": "dns_direct6_1", "address": "https://[2606:4700:4700::1111]/dns-query", "detour": "direct6" },'
+      echo '      { "tag": "dns_direct6_2", "address": "https://[2001:4860:4860::8888]/dns-query", "detour": "direct6" }'
     fi
     if [ -n "$used_outbounds" ]; then
       while IFS= read -r out_tag; do
@@ -2131,7 +2176,7 @@ build_config() {
         if [ "${SB_HAS_DNS_NEW}" -eq 1 ]; then
           echo "      ,{ \"tag\": \"dns_out_${out_tag}\", \"type\": \"https\", \"server\": \"1.1.1.1\", \"detour\": \"${out_tag}\" }"
         else
-          echo "      ,\"https://1.1.1.1/dns-query\""
+          echo "      ,{ \"tag\": \"dns_out_${out_tag}\", \"address\": \"https://1.1.1.1/dns-query\", \"detour\": \"${out_tag}\" }"
         fi
       done <<< "$used_outbounds"
     fi
@@ -2278,6 +2323,7 @@ EOF
   } > "$tmp"
 
   mv "$tmp" "${CONFIG_DIR}/config.json"
+  validate_singbox_config
 }
 
 get_public_ip4() {
