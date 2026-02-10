@@ -772,6 +772,16 @@ json_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
+emit_outbound_with_resolver() {
+  local file="$1" resolver="$2" strategy="$3"
+  if grep -q '"domain_resolver"' "$file"; then
+    sed 's/^/    /' "$file"
+    return 0
+  fi
+  sed -e '$ s/}[[:space:]]*$/,\n  "domain_resolver": { "server": "'"$(json_escape "$resolver")"'", "strategy": "'"$(json_escape "$strategy")"'" }\n}/' "$file" \
+    | sed 's/^/    /'
+}
+
 get_query_param() {
   local key="$1" qs="$2"
   echo "$qs" | tr '&' '\n' | awk -F= -v k="$key" '$1==k {print $2; exit}'
@@ -2014,15 +2024,15 @@ build_config() {
     echo '  },'
     echo '  "dns": {'
     echo '    "servers": ['
-    echo '      { "tag": "dns_direct4_1", "address": "https://1.1.1.1/dns-query", "detour": "direct4" },'
-    echo '      { "tag": "dns_direct4_2", "address": "https://8.8.8.8/dns-query", "detour": "direct4" },'
-    echo '      { "tag": "dns_direct4_3", "address": "https://223.5.5.5/dns-query", "detour": "direct4" },'
-    echo '      { "tag": "dns_direct6_1", "address": "https://[2606:4700:4700::1111]/dns-query", "detour": "direct6" },'
-    echo '      { "tag": "dns_direct6_2", "address": "https://[2001:4860:4860::8888]/dns-query", "detour": "direct6" }'
+    echo '      { "tag": "dns_direct4_1", "type": "https", "server": "1.1.1.1", "detour": "direct4" },'
+    echo '      { "tag": "dns_direct4_2", "type": "https", "server": "8.8.8.8", "detour": "direct4" },'
+    echo '      { "tag": "dns_direct4_3", "type": "https", "server": "223.5.5.5", "detour": "direct4" },'
+    echo '      { "tag": "dns_direct6_1", "type": "https", "server": "2606:4700:4700::1111", "detour": "direct6" },'
+    echo '      { "tag": "dns_direct6_2", "type": "https", "server": "2001:4860:4860::8888", "detour": "direct6" }'
     if [ -n "$used_outbounds" ]; then
       while IFS= read -r out_tag; do
         [ -z "$out_tag" ] && continue
-        echo "      ,{ \"tag\": \"dns_out_${out_tag}\", \"address\": \"https://1.1.1.1/dns-query\", \"detour\": \"${out_tag}\" }"
+        echo "      ,{ \"tag\": \"dns_out_${out_tag}\", \"type\": \"https\", \"server\": \"1.1.1.1\", \"detour\": \"${out_tag}\" }"
       done <<< "$used_outbounds"
     fi
     echo '    ],'
@@ -2038,14 +2048,6 @@ build_config() {
         echo "      { \"domain\": [\"$(json_escape "$domain")\"], \"server\": \"${dns_final}\" }"
       done <<< "$dns_bootstrap_domains"
     fi
-    while IFS='|' read -r tag port out remark proto hy2_pass up down; do
-      [ -z "$tag" ] && continue
-      if [ "$dns_rule_count" -gt 0 ]; then
-        echo '      ,'
-      fi
-      dns_rule_count=$((dns_rule_count+1))
-      echo "      { \"inbound\": [\"$(json_escape "$tag")\"], \"server\": \"dns_out_${out}\" }"
-    done < "$INBOUNDS_FILE"
     echo '    ],'
     echo "    \"final\": \"${dns_final}\","
     echo "    \"strategy\": \"${dns_strategy}\""
@@ -2114,13 +2116,29 @@ EOF
     done < "$INBOUNDS_FILE"
     echo '  ],'
     echo '  "outbounds": ['
+    local used_outbounds_set
+    used_outbounds_set="$(printf "%s\n" "$used_outbounds")"
     for f in "${OUTBOUNDS_DIR}"/*.json; do
       [ -e "$f" ] || continue
+      local base resolver_tag
+      base="$(basename "$f" .json)"
+      resolver_tag=""
+      if echo "$used_outbounds_set" | grep -qx "$base"; then
+        case "$base" in
+          direct4) resolver_tag="dns_direct4_1" ;;
+          direct6) resolver_tag="dns_direct6_1" ;;
+          *) resolver_tag="dns_out_${base}" ;;
+        esac
+      fi
       outbound_count=$((outbound_count+1))
       if [ "$outbound_count" -gt 1 ]; then
         echo '    ,'
       fi
-      sed 's/^/    /' "$f"
+      if [ -n "$resolver_tag" ]; then
+        emit_outbound_with_resolver "$f" "$resolver_tag" "$dns_strategy"
+      else
+        sed 's/^/    /' "$f"
+      fi
     done
     echo '  ],'
     if has_endpoints; then
