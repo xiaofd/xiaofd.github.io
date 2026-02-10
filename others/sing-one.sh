@@ -553,25 +553,39 @@ cf_upsert_dns_record() {
 }
 
 cf_find_zone() {
-  local full_domain="$1" token="$2" candidate
+  local full_domain="$1" token="$2" candidate zone_id
   candidate="$full_domain"
   while [ -n "$candidate" ]; do
-    if cf_get_zone_id "$candidate" "$token" >/dev/null; then
+    zone_id="$(cf_get_zone_id "$candidate" "$token" || true)"
+    if [ -n "$zone_id" ]; then
       echo "$candidate"
       return 0
     fi
+    if [ "$candidate" = "${candidate#*.}" ]; then
+      break
+    fi
     candidate="${candidate#*.}"
-    [ "$candidate" = "$full_domain" ] && break
   done
   echo ""
 }
 
 cf_get_zone_id() {
-  local zone_name="$1" token="$2" resp
+  local zone_name="$1" token="$2" resp zone_id
   resp="$(curl -fsSL -G "https://api.cloudflare.com/client/v4/zones" \
     -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
     --data-urlencode "name=${zone_name}" --data-urlencode "status=active" || true)"
-  echo "$resp" | sed -n 's/.*"id":"\([a-f0-9]\{32\}\)".*/\1/p' | head -n1
+  zone_id="$(echo "$resp" | sed -n 's/.*"id":"\([a-f0-9]\{32\}\)".*/\1/p' | head -n1)"
+  if [ -z "$zone_id" ]; then
+    resp="$(curl -fsSL -G "https://api.cloudflare.com/client/v4/zones" \
+      -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+      --data-urlencode "name=${zone_name}" || true)"
+    zone_id="$(echo "$resp" | sed -n 's/.*"id":"\([a-f0-9]\{32\}\)".*/\1/p' | head -n1)"
+  fi
+  if [ -n "$zone_id" ]; then
+    echo "$zone_id"
+    return 0
+  fi
+  return 1
 }
 
 cf_get_record_id() {
