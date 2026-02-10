@@ -35,6 +35,7 @@ SB_HAS_DOMAIN_RESOLVER=""
 SB_HAS_WG_NEW=""
 SB_HAS_HY2_MASQ=""
 SB_HAS_HY2_IGNORE_BW=""
+SB_HAS_TLS_PIN=""
 
 C_RESET=""
 C_BOLD=""
@@ -444,6 +445,15 @@ gen_hy2_obfs_password() {
   fi
 }
 
+hy2_cert_pin_sha256() {
+  if [ ! -s "$HY2_CERT" ] || ! cmd_exists openssl; then
+    return 1
+  fi
+  openssl x509 -in "$HY2_CERT" -outform der 2>/dev/null \
+    | openssl dgst -sha256 -binary 2>/dev/null \
+    | openssl base64 -A 2>/dev/null
+}
+
 normalize_hy2_masquerade_url() {
   local v
   v="$(printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
@@ -472,6 +482,19 @@ prompt_hy2_hardening() {
   esac
   read -r -p "HY2 伪装目标(抗探测，留空默认: ${DEFAULT_HY2_MASQUERADE}): " masq
   masq="$(normalize_hy2_masquerade_url "$masq")"
+  printf -v "$__obfs_var" '%s' "$obfs_pass"
+  printf -v "$__masq_var" '%s' "$masq"
+}
+
+prompt_hy2_hardening_self() {
+  local __obfs_var="$1" __masq_var="$2"
+  local obfs_pass masq
+  read -r -p "HY2 混淆密码(自签模式强制 obfs，留空自动生成): " obfs_pass
+  if [ -z "$obfs_pass" ]; then
+    obfs_pass="$(gen_hy2_obfs_password)"
+    msg "已生成 HY2 混淆密码: ${obfs_pass}"
+  fi
+  masq="$(normalize_hy2_masquerade_url "")"
   printf -v "$__obfs_var" '%s' "$obfs_pass"
   printf -v "$__masq_var" '%s' "$masq"
 }
@@ -584,7 +607,6 @@ ensure_acme_sh() {
 
 issue_hy2_acme_cert() {
   local domain token ip_choice ip_addr update_dns
-  local cf_zone_id cf_zone_id_input cf_account_id cf_account_id_input
   domain="${HY2_DOMAIN:-}"
   if [ -z "$domain" ]; then
     read -r -p "HY2 证书域名(需解析到本机): " domain
@@ -595,9 +617,6 @@ issue_hy2_acme_cert() {
     read -r -p "Cloudflare Token (DNS): " token
   fi
   [ -z "$token" ] && die "CF Token 不能为空。"
-  cf_zone_id="${CF_Zone_ID:-}"
-  cf_account_id="${CF_Account_ID:-}"
-
   read -r -p "是否自动更新 ${domain} 解析到本机? [y/N]: " update_dns
   case "$update_dns" in
     y|Y)
@@ -609,12 +628,12 @@ issue_hy2_acme_cert() {
         2)
           ip_addr="$(get_public_ip6)"
           [ -z "$ip_addr" ] && die "未获取到 IPv6 公网地址。"
-          cf_upsert_dns_record "$domain" "AAAA" "$ip_addr" "$token" "$cf_zone_id"
+          cf_upsert_dns_record "$domain" "AAAA" "$ip_addr" "$token"
           ;;
         *)
           ip_addr="$(get_public_ip4)"
           [ -z "$ip_addr" ] && die "未获取到 IPv4 公网地址。"
-          cf_upsert_dns_record "$domain" "A" "$ip_addr" "$token" "$cf_zone_id"
+          cf_upsert_dns_record "$domain" "A" "$ip_addr" "$token"
           ;;
       esac
       ;;
@@ -625,27 +644,8 @@ issue_hy2_acme_cert() {
 
   ensure_acme_sh
   export CF_Token="$token"
-  if [ -n "$cf_zone_id" ]; then
-    export CF_Zone_ID="$cf_zone_id"
-  fi
-  if [ -n "$cf_account_id" ]; then
-    export CF_Account_ID="$cf_account_id"
-  fi
-  if ! "$ACME_BIN" --issue --dns dns_cf --server letsencrypt -d "$domain" --keylength 2048; then
-    if [ -z "$cf_zone_id" ] && [ -z "$cf_account_id" ]; then
-      msg "首次申请失败，可填写 Zone ID 或 Account ID 后重试。"
-      read -r -p "Cloudflare Zone ID(可选): " cf_zone_id_input
-      read -r -p "Cloudflare Account ID(可选): " cf_account_id_input
-      [ -n "$cf_zone_id_input" ] && export CF_Zone_ID="$cf_zone_id_input"
-      [ -n "$cf_account_id_input" ] && export CF_Account_ID="$cf_account_id_input"
-      "$ACME_BIN" --issue --dns dns_cf --server letsencrypt -d "$domain" --keylength 2048 || die "申请证书失败。"
-    else
-      die "申请证书失败。"
-    fi
-  fi
+  "$ACME_BIN" --issue --dns dns_cf --server letsencrypt -d "$domain" --keylength 2048 || die "申请证书失败。"
   unset CF_Token
-  unset CF_Zone_ID
-  unset CF_Account_ID
   "$ACME_BIN" --install-cert -d "$domain" \
     --key-file "$HY2_KEY" \
     --fullchain-file "$HY2_CERT" || die "安装证书失败。"
@@ -739,18 +739,35 @@ cf_get_record_id() {
   echo "$resp" | sed -n 's/.*"id":"\([a-f0-9]\{32\}\)".*/\1/p' | head -n1
 }
 
-port_in_config() {
-  local port="$1"
-  if [ -f "$INBOUNDS_FILE" ] && awk -F'|' -v p="$port" '$2==p {found=1} END{exit !found}' "$INBOUNDS_FILE"; then
-    return 0
-  fi
-  return 1
+normalize_inbound_proto() {
+  case "${1:-}" in
+    hy2) echo "hy2" ;;
+    *) echo "vless" ;;
+  esac
+}
+
+port_usage_with_proto() {
+  local port="$1" _wanted_proto="$2" exclude_idx="${3:-0}"
+  local i=0 cur_port
+  [ -f "$INBOUNDS_FILE" ] || { echo "free"; return 0; }
+  while IFS='|' read -r tag cur_port _r1 _r2 _r3 _r4 _r5 _r6 _r7 _r8; do
+    [ -z "$tag" ] && continue
+    i=$((i+1))
+    if [ "$exclude_idx" -gt 0 ] && [ "$i" -eq "$exclude_idx" ]; then
+      continue
+    fi
+    if [ "$cur_port" = "$port" ]; then
+      echo "conflict"
+      return 0
+    fi
+  done < "$INBOUNDS_FILE"
+  echo "free"
 }
 
 port_is_listening() {
   local port="$1"
   if cmd_exists ss; then
-    ss -lnt | awk '{print $4}' | grep -qE "(:|\\])${port}$"
+    ss -ln "( sport = :${port} )" | tail -n +2 | grep -q .
   else
     return 1
   fi
@@ -848,7 +865,8 @@ EOF
 }
 
 prompt_port() {
-  local port ans
+  local proto="${1:-vless}" exclude_idx="${2:-0}" port ans usage
+  proto="$(normalize_inbound_proto "$proto")"
   while true; do
     read -r -p "监听端口 [1-65535]: " port
     if ! echo "$port" | grep -qE '^[0-9]+$'; then
@@ -859,11 +877,15 @@ prompt_port() {
       ui "端口范围错误。"
       continue
     fi
-    if port_in_config "$port"; then
-      ui "该端口已在当前配置中使用。"
-      continue
-    fi
-    if port_is_listening "$port"; then
+    usage="$(port_usage_with_proto "$port" "$proto" "$exclude_idx")"
+    case "$usage" in
+      conflict)
+        ui "该端口已被其他入口使用，不能重复。"
+        ;;
+      *) ;;
+    esac
+    [ "$usage" = "conflict" ] && continue
+    if [ "$usage" = "free" ] && port_is_listening "$port"; then
       read -r -p "端口疑似被占用，继续使用？[y/N]: " ans
       case "$ans" in
         y|Y) ;;
@@ -898,7 +920,7 @@ urlencode() {
 
 is_ip_addr() {
   local v="$1"
-  if echo "$v" | grep -qE '^[0-9]+(\\.[0-9]+){3}$'; then
+  if echo "$v" | grep -qE '^[0-9]+(\.[0-9]+){3}$'; then
     return 0
   fi
   if echo "$v" | grep -q ":"; then
@@ -909,7 +931,7 @@ is_ip_addr() {
 
 is_domain_name() {
   local v="$1"
-  echo "$v" | grep -qiE '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+  echo "$v" | grep -qiE '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
 }
 
 normalize_domain_candidate() {
@@ -946,9 +968,9 @@ get_outbound_domains() {
     done
   fi
   if [ -f "${OUTBOUNDS_DIR}/${tag}.link" ]; then
-    sed -n 's/.*@\\([^:/?#]*\\).*/\\1/p' "${OUTBOUNDS_DIR}/${tag}.link"
-    sed -n 's/.*[?&]sni=\\([^&]*\\).*/\\1/p' "${OUTBOUNDS_DIR}/${tag}.link"
-    sed -n 's/.*[?&]host=\\([^&]*\\).*/\\1/p' "${OUTBOUNDS_DIR}/${tag}.link"
+    sed -n 's/.*@\([^:/?#]*\).*/\1/p' "${OUTBOUNDS_DIR}/${tag}.link"
+    sed -n 's/.*[?&]sni=\([^&]*\).*/\1/p' "${OUTBOUNDS_DIR}/${tag}.link"
+    sed -n 's/.*[?&]host=\([^&]*\).*/\1/p' "${OUTBOUNDS_DIR}/${tag}.link"
   fi
 }
 
@@ -1012,6 +1034,7 @@ detect_singbox_features() {
   SB_HAS_WG_NEW=1
   SB_HAS_HY2_MASQ=1
   SB_HAS_HY2_IGNORE_BW=1
+  SB_HAS_TLS_PIN=1
 
   if [ ! -x "$SB_BIN" ]; then
     return 0
@@ -1022,6 +1045,9 @@ detect_singbox_features() {
   if [ -n "$sb_version" ] && ! version_ge "$sb_version" "1.11.0"; then
     SB_HAS_HY2_MASQ=0
     SB_HAS_HY2_IGNORE_BW=0
+  fi
+  if [ -n "$sb_version" ] && ! version_ge "$sb_version" "1.13.0"; then
+    SB_HAS_TLS_PIN=0
   fi
 
   t="$(tmp_path sb_feature.json)"
@@ -1071,6 +1097,31 @@ EOF
 EOF
   if ! singbox_check_config "$t"; then
     SB_HAS_WG_NEW=0
+  fi
+
+  if [ "${SB_HAS_TLS_PIN}" -eq 1 ]; then
+    cat > "$t" <<'EOF'
+{
+  "log": {"level":"warn"},
+  "outbounds": [
+    {
+      "type": "hysteria2",
+      "tag": "probe",
+      "server": "example.com",
+      "server_port": 443,
+      "password": "p",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com",
+        "certificate_public_key_sha256": ["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="]
+      }
+    }
+  ]
+}
+EOF
+    if ! singbox_check_config "$t"; then
+      SB_HAS_TLS_PIN=0
+    fi
   fi
 }
 
@@ -1464,7 +1515,7 @@ EOF
 build_hy2_outbound() {
   local link="$1" tag="$2"
   local base qs userinfo hostport host port password
-  local sni insecure alpn obfs obfs_pwd up down auth
+  local sni insecure alpn obfs obfs_pwd up down auth pin_sha
 
   link="${link#hysteria2://}"
   link="${link#hy2://}"
@@ -1496,6 +1547,9 @@ build_hy2_outbound() {
   insecure="$(get_query_param insecure "$qs")"
   obfs="$(urldecode "$(get_query_param obfs "$qs")")"
   obfs_pwd="$(urldecode "$(get_query_param obfs-password "$qs")")"
+  [ -z "$obfs_pwd" ] && obfs_pwd="$(urldecode "$(get_query_param obfs_password "$qs")")"
+  pin_sha="$(urldecode "$(get_query_param pinSHA256 "$qs")")"
+  [ -z "$pin_sha" ] && pin_sha="$(urldecode "$(get_query_param pinsha256 "$qs")")"
   up="$(get_query_param upmbps "$qs")"
   [ -z "$up" ] && up="$(get_query_param up_mbps "$qs")"
   down="$(get_query_param downmbps "$qs")"
@@ -1509,6 +1563,17 @@ build_hy2_outbound() {
   local tls_items="\"enabled\":true,\"server_name\":\"$(json_escape "${sni:-$host}")\""
   if [ -n "$alpn" ]; then
     tls_items="${tls_items},\"alpn\":$(json_array_from_csv "$alpn")"
+  fi
+  if [ -n "$pin_sha" ]; then
+    detect_singbox_features
+    if [ "${SB_HAS_TLS_PIN}" -eq 1 ]; then
+      tls_items="${tls_items},\"certificate_public_key_sha256\":[\"$(json_escape "$pin_sha")\"]"
+    else
+      if [ "$insecure" != "1" ] && [ "$insecure" != "true" ]; then
+        ui "提示: 当前 sing-box 版本不支持 pinSHA256，已自动回退 insecure=1。"
+      fi
+      insecure="1"
+    fi
   fi
   if [ "$insecure" = "1" ] || [ "$insecure" = "true" ]; then
     tls_items="${tls_items},\"insecure\":true"
@@ -1712,10 +1777,18 @@ get_wgcf_version() {
 
 setup_warp() {
   local ver arch url priv addr peer_pub endpoint mtu addr4 addr6 allowed allowed_json
-  if [ -f "${OUTBOUNDS_DIR}/warp.json" ] || [ -f "${ENDPOINTS_DIR}/warp.json" ]; then
-    return 0
+  if [ -f "${ENDPOINTS_DIR}/warp.json" ]; then
+    if singbox_check_endpoint_file "${ENDPOINTS_DIR}/warp.json"; then
+      return 0
+    fi
+    rm -f "${ENDPOINTS_DIR}/warp.json"
   fi
-  rm -f "${OUTBOUNDS_DIR}/warp.json" "${ENDPOINTS_DIR}/warp.json" >/dev/null 2>&1 || true
+  if [ -f "${OUTBOUNDS_DIR}/warp.json" ]; then
+    if singbox_check_outbound_file "${OUTBOUNDS_DIR}/warp.json"; then
+      return 0
+    fi
+    rm -f "${OUTBOUNDS_DIR}/warp.json"
+  fi
   ensure_dirs
   ensure_tmp_dir
   rm -rf "$WGCF_DIR"
@@ -2134,11 +2207,6 @@ add_inbound() {
   down=""
   hy2_obfs=""
   hy2_masq=""
-  port="$(prompt_port)"
-  out_tag="$(choose_outbound)"
-  if ! echo "$out_tag" | grep -qE '^[A-Za-z0-9_]+$'; then
-    die "出口选择异常，请重试。"
-  fi
   if [ -n "${AUTO_PROTO:-}" ]; then
     proto="$AUTO_PROTO"
     AUTO_PROTO=""
@@ -2158,11 +2226,16 @@ add_inbound() {
   if [ "$proto" = "hy2" ] && [ ! -f "$MANAGER_CONF" ]; then
     init_base_config_silent
   fi
+  port="$(prompt_port "$proto")"
+  out_tag="$(choose_outbound)"
+  if ! echo "$out_tag" | grep -qE '^[A-Za-z0-9_]+$'; then
+    die "出口选择异常，请重试。"
+  fi
   if [ "$proto" = "hy2" ]; then
     [ -z "${HY2_CERT_MODE:-}" ] && HY2_CERT_MODE="self"
     [ -z "${HY2_DOMAIN:-}" ] && HY2_DOMAIN=""
     ui "${C_BOLD}${C_BLUE}HY2 证书类型：${C_RESET}"
-    ui "  ${C_YELLOW}1)${C_RESET} 自签证书(需 insecure)"
+    ui "  ${C_YELLOW}1)${C_RESET} 自签证书(推荐 pin 验证，强制 obfs)"
     ui "  ${C_YELLOW}2)${C_RESET} 自动申请证书(Cloudflare DNS API)"
     read -r -p "请选择 [1-2]: " choice
     case "$choice" in
@@ -2172,6 +2245,7 @@ add_inbound() {
         ;;
       *)
         HY2_CERT_MODE="self"
+        HY2_DOMAIN=""
         ;;
     esac
     save_manager_conf
@@ -2182,7 +2256,11 @@ add_inbound() {
     fi
     read -r -p "HY2 上行带宽(Mbps，可留空): " up
     read -r -p "HY2 下行带宽(Mbps，可留空): " down
-    prompt_hy2_hardening hy2_obfs hy2_masq
+    if [ "${HY2_CERT_MODE:-self}" = "self" ]; then
+      prompt_hy2_hardening_self hy2_obfs hy2_masq
+    else
+      prompt_hy2_hardening hy2_obfs hy2_masq
+    fi
   fi
   if [ "$proto" = "hy2" ]; then
     read -r -p "别名(用于分享链接，留空默认 hy2-${port}): " remark
@@ -2271,6 +2349,19 @@ select_inbound_index() {
   done
 }
 
+get_inbound_proto_by_index() {
+  local idx="$1" i=0 proto
+  while IFS='|' read -r tag port out remark proto _r1 _r2 _r3 _r4 _r5; do
+    [ -z "$tag" ] && continue
+    i=$((i+1))
+    if [ "$i" -eq "$idx" ]; then
+      normalize_inbound_proto "$proto"
+      return 0
+    fi
+  done < "$INBOUNDS_FILE"
+  echo "vless"
+}
+
 update_inbound_line() {
   local idx="$1" new_port="$2" new_out="$3"
   local tmp
@@ -2324,9 +2415,10 @@ remove_inbound_line() {
 }
 
 change_port() {
-  local idx new_port
+  local idx new_port proto
   idx="$(select_inbound_index)" || return 0
-  new_port="$(prompt_port)"
+  proto="$(get_inbound_proto_by_index "$idx")"
+  new_port="$(prompt_port "$proto" "$idx")"
   update_inbound_line "$idx" "$new_port" ""
   build_config
   restart_singbox_with_check "$new_port"
@@ -2363,7 +2455,7 @@ change_protocol() {
   if [ "$proto" = "hy2" ]; then
     load_manager_conf
     ui "${C_BOLD}${C_BLUE}HY2 证书类型：${C_RESET}"
-    ui "  ${C_YELLOW}1)${C_RESET} 自签证书(需 insecure)"
+    ui "  ${C_YELLOW}1)${C_RESET} 自签证书(推荐 pin 验证，强制 obfs)"
     ui "  ${C_YELLOW}2)${C_RESET} 自动申请证书(Cloudflare DNS API)"
     read -r -p "请选择 [1-2]: " choice
     case "$choice" in
@@ -2373,6 +2465,7 @@ change_protocol() {
         ;;
       *)
         HY2_CERT_MODE="self"
+        HY2_DOMAIN=""
         ;;
     esac
     save_manager_conf
@@ -2383,7 +2476,11 @@ change_protocol() {
     fi
     read -r -p "HY2 上行带宽(Mbps，可留空): " up
     read -r -p "HY2 下行带宽(Mbps，可留空): " down
-    prompt_hy2_hardening hy2_obfs hy2_masq
+    if [ "${HY2_CERT_MODE:-self}" = "self" ]; then
+      prompt_hy2_hardening_self hy2_obfs hy2_masq
+    else
+      prompt_hy2_hardening hy2_obfs hy2_masq
+    fi
   fi
   update_inbound_proto_line "$idx" "$proto" "$hy2_pass" "$up" "$down" "$hy2_obfs" "$hy2_masq"
   build_config
@@ -2702,14 +2799,20 @@ show_info() {
     [ -z "${proto:-}" ] && proto="vless"
     hy2_pass="${hy2_pass:-}"
     if [ "$proto" = "hy2" ]; then
-      local insecure_q="" obfs_q="" sni_name
-      local hy2_pass_enc
+      local insecure_q="" pin_q="" obfs_q="" sni_name
+      local hy2_pass_enc cert_pin
       sni_name="${SERVER_NAME}"
       if [ "${HY2_CERT_MODE:-self}" = "acme" ] && [ -n "${HY2_DOMAIN:-}" ]; then
         sni_name="${HY2_DOMAIN}"
       fi
       if [ "${HY2_CERT_MODE:-self}" = "self" ]; then
-        insecure_q="&insecure=1"
+        cert_pin="$(hy2_cert_pin_sha256 || true)"
+        if [ -n "$cert_pin" ]; then
+          pin_q="&pinSHA256=$(urlencode "$cert_pin")"
+        else
+          insecure_q="&insecure=1"
+          msg "  (未计算到证书 pin，已回退 insecure=1)"
+        fi
       fi
       if [ -z "$hy2_pass" ]; then
         msg "  (HY2 密码为空，无法生成分享链接)"
@@ -2720,16 +2823,16 @@ show_info() {
         obfs_q="&obfs=salamander&obfs-password=$(urlencode "$hy2_obfs")"
       fi
       if [ "$have_share" -eq 1 ]; then
-        msg "  hysteria2://${hy2_pass_enc}@${host}:${port}?sni=${sni_name}&alpn=h3${insecure_q}${obfs_q}#${frag}"
+        msg "  hysteria2://${hy2_pass_enc}@${host}:${port}?sni=${sni_name}&alpn=h3${pin_q}${insecure_q}${obfs_q}#${frag}"
       else
         if [ -n "$host4" ]; then
-          msg "  hysteria2://${hy2_pass_enc}@${host4}:${port}?sni=${sni_name}&alpn=h3${insecure_q}${obfs_q}#${frag}"
+          msg "  hysteria2://${hy2_pass_enc}@${host4}:${port}?sni=${sni_name}&alpn=h3${pin_q}${insecure_q}${obfs_q}#${frag}"
         fi
         if [ -n "$host6" ]; then
-          msg "  hysteria2://${hy2_pass_enc}@[${host6}]:${port}?sni=${sni_name}&alpn=h3${insecure_q}${obfs_q}#${frag}"
+          msg "  hysteria2://${hy2_pass_enc}@[${host6}]:${port}?sni=${sni_name}&alpn=h3${pin_q}${insecure_q}${obfs_q}#${frag}"
         fi
         if [ -z "$host4" ] && [ -z "$host6" ]; then
-          msg "  hysteria2://${hy2_pass_enc}@SERVER_IP:${port}?sni=${sni_name}&alpn=h3${insecure_q}${obfs_q}#${frag}"
+          msg "  hysteria2://${hy2_pass_enc}@SERVER_IP:${port}?sni=${sni_name}&alpn=h3${pin_q}${insecure_q}${obfs_q}#${frag}"
         fi
       fi
     else

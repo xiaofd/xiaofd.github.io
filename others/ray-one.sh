@@ -629,7 +629,7 @@ json_escape() {
 
 is_ip_addr() {
   local v="$1"
-  if echo "$v" | grep -qE '^[0-9]+(\\.[0-9]+){3}$'; then
+  if echo "$v" | grep -qE '^[0-9]+(\.[0-9]+){3}$'; then
     return 0
   fi
   if echo "$v" | grep -q ":"; then
@@ -640,7 +640,7 @@ is_ip_addr() {
 
 is_domain_name() {
   local v="$1"
-  echo "$v" | grep -qiE '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+  echo "$v" | grep -qiE '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
 }
 
 normalize_domain_candidate() {
@@ -675,9 +675,9 @@ get_outbound_domains() {
     done
   fi
   if [ -f "${OUTBOUNDS_DIR}/${tag}.link" ]; then
-    sed -n 's/.*@\\([^:/?#]*\\).*/\\1/p' "${OUTBOUNDS_DIR}/${tag}.link"
-    sed -n 's/.*[?&]sni=\\([^&]*\\).*/\\1/p' "${OUTBOUNDS_DIR}/${tag}.link"
-    sed -n 's/.*[?&]host=\\([^&]*\\).*/\\1/p' "${OUTBOUNDS_DIR}/${tag}.link"
+    sed -n 's/.*@\([^:/?#]*\).*/\1/p' "${OUTBOUNDS_DIR}/${tag}.link"
+    sed -n 's/.*[?&]sni=\([^&]*\).*/\1/p' "${OUTBOUNDS_DIR}/${tag}.link"
+    sed -n 's/.*[?&]host=\([^&]*\).*/\1/p' "${OUTBOUNDS_DIR}/${tag}.link"
   fi
 }
 
