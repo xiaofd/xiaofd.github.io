@@ -143,7 +143,7 @@ ensure_tmp_dir() {
 tmp_path() {
   local name="$1"
   ensure_tmp_dir
-  echo "${TMP_DIR}/${name}.$$"
+  echo "${TMP_DIR}/${name}.$$.${RANDOM}"
 }
 
 need_root() {

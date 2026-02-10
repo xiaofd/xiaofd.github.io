@@ -152,7 +152,7 @@ ensure_tmp_dir() {
 tmp_path() {
   local name="$1"
   ensure_tmp_dir
-  echo "${TMP_DIR}/${name}.$$"
+  echo "${TMP_DIR}/${name}.$$.${RANDOM}"
 }
 
 need_root() {
@@ -803,6 +803,49 @@ singbox_check_config() {
   local cfg="$1"
   [ -x "$SB_BIN" ] || return 1
   "$SB_BIN" check -c "$cfg" >/dev/null 2>&1
+}
+
+singbox_check_outbound_file() {
+  local outbound_file="$1" t check_log
+  t="$(tmp_path sb_outbound_probe.json)"
+  check_log="$(tmp_path sb_outbound_probe.log)"
+  {
+    echo '{'
+    echo '  "log": {"level": "warn"},'
+    echo '  "outbounds": ['
+    sed 's/^/    /' "$outbound_file"
+    echo '  ]'
+    echo '}'
+  } > "$t"
+  if "$SB_BIN" check -c "$t" >"$check_log" 2>&1; then
+    rm -f "$check_log"
+    SB_LAST_OUTBOUND_CHECK_LOG=""
+    return 0
+  fi
+  SB_LAST_OUTBOUND_CHECK_LOG="$check_log"
+  return 1
+}
+
+singbox_check_endpoint_file() {
+  local endpoint_file="$1" t check_log
+  t="$(tmp_path sb_endpoint_probe.json)"
+  check_log="$(tmp_path sb_endpoint_probe.log)"
+  {
+    echo '{'
+    echo '  "log": {"level": "warn"},'
+    echo '  "outbounds": [{ "type": "direct", "tag": "direct" }],'
+    echo '  "endpoints": ['
+    sed 's/^/    /' "$endpoint_file"
+    echo '  ]'
+    echo '}'
+  } > "$t"
+  if "$SB_BIN" check -c "$t" >"$check_log" 2>&1; then
+    rm -f "$check_log"
+    SB_LAST_OUTBOUND_CHECK_LOG=""
+    return 0
+  fi
+  SB_LAST_OUTBOUND_CHECK_LOG="$check_log"
+  return 1
 }
 
 detect_singbox_features() {
@@ -1503,11 +1546,11 @@ get_wgcf_version() {
 }
 
 setup_warp() {
-  local ver arch url priv addr peer_pub endpoint mtu reserved addr4 addr6 res_json allowed allowed_json peer_reserved
-  if [ -f "${OUTBOUNDS_DIR}/warp.json" ]; then
+  local ver arch url priv addr peer_pub endpoint mtu addr4 addr6 allowed allowed_json
+  if [ -f "${OUTBOUNDS_DIR}/warp.json" ] || [ -f "${ENDPOINTS_DIR}/warp.json" ]; then
     return 0
   fi
-  rm -f "${ENDPOINTS_DIR}/warp.json" >/dev/null 2>&1 || true
+  rm -f "${OUTBOUNDS_DIR}/warp.json" "${ENDPOINTS_DIR}/warp.json" >/dev/null 2>&1 || true
   ensure_dirs
   ensure_tmp_dir
   rm -rf "$WGCF_DIR"
@@ -1529,19 +1572,10 @@ setup_warp() {
   peer_pub="$(awk -F' = ' '/^PublicKey/ {print $2; exit}' "${WGCF_DIR}/wgcf-profile.conf")"
   endpoint="$(awk -F' = ' '/^Endpoint/ {print $2; exit}' "${WGCF_DIR}/wgcf-profile.conf")"
   mtu="$(awk -F' = ' '/^MTU/ {print $2; exit}' "${WGCF_DIR}/wgcf-profile.conf")"
-  reserved="$(awk -F' = ' '/^Reserved/ {print $2; exit}' "${WGCF_DIR}/wgcf-profile.conf")"
   allowed="$(awk -F' = ' '/^AllowedIPs/ {print $2; exit}' "${WGCF_DIR}/wgcf-profile.conf")"
 
   IFS=',' read -r addr4 addr6 <<< "$addr"
   [ -z "$mtu" ] && mtu="1280"
-
-  if [ -n "$reserved" ]; then
-    reserved="$(echo "$reserved" | tr -d ' ')"
-    res_json="$(echo "$reserved" | awk -F',' '{printf "[%s,%s,%s]",$1,$2,$3}')"
-    peer_reserved=",\n      \"reserved\": ${res_json}"
-  else
-    peer_reserved=""
-  fi
 
   allowed="$(echo "$allowed" | tr -d ' ')"
   if [ -z "$allowed" ]; then
@@ -1562,27 +1596,26 @@ setup_warp() {
     endpoint_port="2408"
   fi
 
-  detect_singbox_features
-  if [ "${SB_HAS_WG_NEW}" -eq 1 ]; then
-    cat > "${OUTBOUNDS_DIR}/warp.json" <<EOF
+  local warp_endpoint_new_tmp warp_endpoint_legacy_tmp warp_new_tmp warp_old_tmp
+  warp_endpoint_new_tmp="$(tmp_path warp.endpoint.new.json)"
+  warp_endpoint_legacy_tmp="$(tmp_path warp.endpoint.legacy.json)"
+  warp_new_tmp="$(tmp_path warp.new.json)"
+  warp_old_tmp="$(tmp_path warp.old.json)"
+
+  cat > "$warp_endpoint_new_tmp" <<EOF
 {
   "type": "wireguard",
   "tag": "warp",
   "local_address": ["$(json_escape "$addr4")"$( [ -n "$addr6" ] && printf ', "%s"' "$(json_escape "$addr6")" )],
   "private_key": "$(json_escape "$priv")",
-  "mtu": ${mtu},
-  "peers": [
-    {
-      "server": "$(json_escape "$endpoint_host")",
-      "server_port": ${endpoint_port},
-      "public_key": "$(json_escape "$peer_pub")",
-      "allowed_ips": ${allowed_json}${peer_reserved}
-    }
-  ]
+  "server": "$(json_escape "$endpoint_host")",
+  "server_port": ${endpoint_port},
+  "peer_public_key": "$(json_escape "$peer_pub")",
+  "mtu": ${mtu}
 }
 EOF
-  else
-    cat > "${OUTBOUNDS_DIR}/warp.json" <<EOF
+
+  cat > "$warp_endpoint_legacy_tmp" <<EOF
 {
   "type": "wireguard",
   "tag": "warp",
@@ -1594,11 +1627,100 @@ EOF
       "public_key": "$(json_escape "$peer_pub")",
       "allowed_ips": ${allowed_json},
       "address": "$(json_escape "$endpoint_host")",
-      "port": ${endpoint_port}${peer_reserved}
+      "port": ${endpoint_port}
     }
   ]
 }
 EOF
+
+  cat > "$warp_new_tmp" <<EOF
+{
+  "type": "wireguard",
+  "tag": "warp",
+  "local_address": ["$(json_escape "$addr4")"$( [ -n "$addr6" ] && printf ', "%s"' "$(json_escape "$addr6")" )],
+  "private_key": "$(json_escape "$priv")",
+  "mtu": ${mtu},
+  "peers": [
+    {
+      "server": "$(json_escape "$endpoint_host")",
+      "server_port": ${endpoint_port},
+      "public_key": "$(json_escape "$peer_pub")",
+      "allowed_ips": ${allowed_json}
+    }
+  ]
+}
+EOF
+
+  cat > "$warp_old_tmp" <<EOF
+{
+  "type": "wireguard",
+  "tag": "warp",
+  "private_key": "$(json_escape "$priv")",
+  "address": ["$(json_escape "$addr4")"$( [ -n "$addr6" ] && printf ', "%s"' "$(json_escape "$addr6")" )],
+  "mtu": ${mtu},
+  "peers": [
+    {
+      "public_key": "$(json_escape "$peer_pub")",
+      "allowed_ips": ${allowed_json},
+      "address": "$(json_escape "$endpoint_host")",
+      "port": ${endpoint_port}
+    }
+  ]
+}
+EOF
+
+  local probe_endpoint_new_log="" probe_endpoint_legacy_log="" probe_new_log="" probe_old_log=""
+  if singbox_check_endpoint_file "$warp_endpoint_new_tmp"; then
+    mv "$warp_endpoint_new_tmp" "${ENDPOINTS_DIR}/warp.json"
+    rm -f "$warp_endpoint_legacy_tmp" "$warp_new_tmp" "$warp_old_tmp"
+  else
+    probe_endpoint_new_log="${SB_LAST_OUTBOUND_CHECK_LOG:-}"
+    if singbox_check_endpoint_file "$warp_endpoint_legacy_tmp"; then
+      mv "$warp_endpoint_legacy_tmp" "${ENDPOINTS_DIR}/warp.json"
+      rm -f "$warp_endpoint_new_tmp" "$warp_new_tmp" "$warp_old_tmp"
+      [ -n "$probe_endpoint_new_log" ] && rm -f "$probe_endpoint_new_log" || true
+    else
+      probe_endpoint_legacy_log="${SB_LAST_OUTBOUND_CHECK_LOG:-}"
+      if singbox_check_outbound_file "$warp_new_tmp"; then
+        mv "$warp_new_tmp" "${OUTBOUNDS_DIR}/warp.json"
+        rm -f "$warp_endpoint_new_tmp" "$warp_endpoint_legacy_tmp" "$warp_old_tmp"
+        [ -n "$probe_endpoint_new_log" ] && rm -f "$probe_endpoint_new_log" || true
+        [ -n "$probe_endpoint_legacy_log" ] && rm -f "$probe_endpoint_legacy_log" || true
+      else
+        probe_new_log="${SB_LAST_OUTBOUND_CHECK_LOG:-}"
+        if singbox_check_outbound_file "$warp_old_tmp"; then
+          mv "$warp_old_tmp" "${OUTBOUNDS_DIR}/warp.json"
+          rm -f "$warp_endpoint_new_tmp" "$warp_endpoint_legacy_tmp" "$warp_new_tmp"
+          [ -n "$probe_endpoint_new_log" ] && rm -f "$probe_endpoint_new_log" || true
+          [ -n "$probe_endpoint_legacy_log" ] && rm -f "$probe_endpoint_legacy_log" || true
+          [ -n "$probe_new_log" ] && rm -f "$probe_new_log" || true
+        else
+          probe_old_log="${SB_LAST_OUTBOUND_CHECK_LOG:-}"
+          rm -f "$warp_endpoint_new_tmp" "$warp_endpoint_legacy_tmp" "$warp_new_tmp" "$warp_old_tmp"
+          if [ -n "$probe_endpoint_new_log" ] && [ -f "$probe_endpoint_new_log" ]; then
+            ui "WARP Endpoint(新) 校验输出："
+            sed 's/^/  /' "$probe_endpoint_new_log" >&2 || true
+            rm -f "$probe_endpoint_new_log"
+          fi
+          if [ -n "$probe_endpoint_legacy_log" ] && [ -f "$probe_endpoint_legacy_log" ]; then
+            ui "WARP Endpoint(旧) 校验输出："
+            sed 's/^/  /' "$probe_endpoint_legacy_log" >&2 || true
+            rm -f "$probe_endpoint_legacy_log"
+          fi
+          if [ -n "$probe_new_log" ] && [ -f "$probe_new_log" ]; then
+            ui "WARP Outbound(新) 校验输出："
+            sed 's/^/  /' "$probe_new_log" >&2 || true
+            rm -f "$probe_new_log"
+          fi
+          if [ -n "$probe_old_log" ] && [ -f "$probe_old_log" ]; then
+            ui "WARP Outbound(旧) 校验输出："
+            sed 's/^/  /' "$probe_old_log" >&2 || true
+            rm -f "$probe_old_log"
+          fi
+          die "WARP 配置生成失败：当前 sing-box 版本不兼容生成的 WireGuard 出口格式。"
+        fi
+      fi
+    fi
   fi
 
   mkdir -p "${CONFIG_DIR}/warp"
@@ -2290,11 +2412,25 @@ EOF
       echo '  "endpoints": ['
       for f in "${ENDPOINTS_DIR}"/*.json; do
         [ -e "$f" ] || continue
+        local base resolver_tag
+        base="$(basename "$f" .json)"
+        resolver_tag=""
+        if [ "${SB_HAS_DOMAIN_RESOLVER}" -eq 1 ] && echo "$used_outbounds_set" | grep -qx "$base"; then
+          case "$base" in
+            direct4) resolver_tag="dns_direct4_1" ;;
+            direct6) resolver_tag="dns_direct6_1" ;;
+            *) resolver_tag="dns_out_${base}" ;;
+          esac
+        fi
         endpoint_count=$((endpoint_count+1))
         if [ "$endpoint_count" -gt 1 ]; then
           echo '    ,'
         fi
-        sed 's/^/    /' "$f"
+        if [ -n "$resolver_tag" ]; then
+          emit_outbound_with_resolver "$f" "$resolver_tag" "$dns_strategy"
+        else
+          sed 's/^/    /' "$f"
+        fi
       done
       echo '  ],'
     fi
