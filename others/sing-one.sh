@@ -28,6 +28,9 @@ DEFAULT_SNI="www.apple.com"
 HY2_CERT_MODE="self"
 HY2_DOMAIN=""
 AUTO_PROTO=""
+SB_HAS_DNS_NEW=""
+SB_HAS_DOMAIN_RESOLVER=""
+SB_HAS_WG_NEW=""
 
 C_RESET=""
 C_BOLD=""
@@ -772,6 +775,69 @@ json_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
+singbox_check_config() {
+  local cfg="$1"
+  [ -x "$SB_BIN" ] || return 1
+  "$SB_BIN" check -c "$cfg" >/dev/null 2>&1
+}
+
+detect_singbox_features() {
+  [ -n "${SB_HAS_DNS_NEW:-}" ] && return 0
+  SB_HAS_DNS_NEW=1
+  SB_HAS_DOMAIN_RESOLVER=1
+  SB_HAS_WG_NEW=1
+
+  if [ ! -x "$SB_BIN" ]; then
+    return 0
+  fi
+
+  local t
+  t="$(tmp_path sb_feature.json)"
+  cat > "$t" <<'EOF'
+{
+  "log": {"level":"warn"},
+  "dns": {"servers": [{"tag":"d","type":"https","server":"1.1.1.1"}]},
+  "outbounds": [{"type":"direct","tag":"direct"}]
+}
+EOF
+  if ! singbox_check_config "$t"; then
+    SB_HAS_DNS_NEW=0
+  fi
+
+  cat > "$t" <<'EOF'
+{
+  "log": {"level":"warn"},
+  "dns": {"servers": ["https://1.1.1.1/dns-query"]},
+  "outbounds": [
+    {"type":"direct","tag":"direct", "domain_resolver": {"server":"dns"}}
+  ]
+}
+EOF
+  if ! singbox_check_config "$t"; then
+    SB_HAS_DOMAIN_RESOLVER=0
+  fi
+
+  cat > "$t" <<'EOF'
+{
+  "log": {"level":"warn"},
+  "outbounds": [
+    {
+      "type": "wireguard",
+      "tag": "warp",
+      "local_address": ["172.16.0.2/32"],
+      "private_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "peers": [
+        {"server": "example.com", "server_port": 2408, "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "allowed_ips": ["0.0.0.0/0"]}
+      ]
+    }
+  ]
+}
+EOF
+  if ! singbox_check_config "$t"; then
+    SB_HAS_WG_NEW=0
+  fi
+}
+
 emit_outbound_with_resolver() {
   local file="$1" resolver="$2" strategy="$3"
   if grep -q '"domain_resolver"' "$file"; then
@@ -1454,7 +1520,27 @@ setup_warp() {
     endpoint_port="2408"
   fi
 
-  cat > "${OUTBOUNDS_DIR}/warp.json" <<EOF
+  detect_singbox_features
+  if [ "${SB_HAS_WG_NEW}" -eq 1 ]; then
+    cat > "${OUTBOUNDS_DIR}/warp.json" <<EOF
+{
+  "type": "wireguard",
+  "tag": "warp",
+  "local_address": ["$(json_escape "$addr4")"$( [ -n "$addr6" ] && printf ', "%s"' "$(json_escape "$addr6")" )],
+  "private_key": "$(json_escape "$priv")",
+  "mtu": ${mtu},
+  "peers": [
+    {
+      "server": "$(json_escape "$endpoint_host")",
+      "server_port": ${endpoint_port},
+      "public_key": "$(json_escape "$peer_pub")",
+      "allowed_ips": ${allowed_json}${peer_reserved}
+    }
+  ]
+}
+EOF
+  else
+    cat > "${OUTBOUNDS_DIR}/warp.json" <<EOF
 {
   "type": "wireguard",
   "tag": "warp",
@@ -1471,6 +1557,7 @@ setup_warp() {
   ]
 }
 EOF
+  fi
 
   mkdir -p "${CONFIG_DIR}/warp"
   cp "${WGCF_DIR}/wgcf-account.toml" "${CONFIG_DIR}/warp/" || true
@@ -1969,6 +2056,7 @@ build_config() {
   load_manager_conf
   ensure_direct_outbounds
   sanitize_inbounds
+  detect_singbox_features
 
   if [ ! -s "$INBOUNDS_FILE" ]; then
     die "未配置任何入口。"
@@ -2024,15 +2112,27 @@ build_config() {
     echo '  },'
     echo '  "dns": {'
     echo '    "servers": ['
-    echo '      { "tag": "dns_direct4_1", "type": "https", "server": "1.1.1.1", "detour": "direct4" },'
-    echo '      { "tag": "dns_direct4_2", "type": "https", "server": "8.8.8.8", "detour": "direct4" },'
-    echo '      { "tag": "dns_direct4_3", "type": "https", "server": "223.5.5.5", "detour": "direct4" },'
-    echo '      { "tag": "dns_direct6_1", "type": "https", "server": "2606:4700:4700::1111", "detour": "direct6" },'
-    echo '      { "tag": "dns_direct6_2", "type": "https", "server": "2001:4860:4860::8888", "detour": "direct6" }'
+    if [ "${SB_HAS_DNS_NEW}" -eq 1 ]; then
+      echo '      { "tag": "dns_direct4_1", "type": "https", "server": "1.1.1.1", "detour": "direct4" },'
+      echo '      { "tag": "dns_direct4_2", "type": "https", "server": "8.8.8.8", "detour": "direct4" },'
+      echo '      { "tag": "dns_direct4_3", "type": "https", "server": "223.5.5.5", "detour": "direct4" },'
+      echo '      { "tag": "dns_direct6_1", "type": "https", "server": "2606:4700:4700::1111", "detour": "direct6" },'
+      echo '      { "tag": "dns_direct6_2", "type": "https", "server": "2001:4860:4860::8888", "detour": "direct6" }'
+    else
+      echo '      "https://1.1.1.1/dns-query",'
+      echo '      "https://8.8.8.8/dns-query",'
+      echo '      "https://223.5.5.5/dns-query",'
+      echo '      "https://[2606:4700:4700::1111]/dns-query",'
+      echo '      "https://[2001:4860:4860::8888]/dns-query"'
+    fi
     if [ -n "$used_outbounds" ]; then
       while IFS= read -r out_tag; do
         [ -z "$out_tag" ] && continue
-        echo "      ,{ \"tag\": \"dns_out_${out_tag}\", \"type\": \"https\", \"server\": \"1.1.1.1\", \"detour\": \"${out_tag}\" }"
+        if [ "${SB_HAS_DNS_NEW}" -eq 1 ]; then
+          echo "      ,{ \"tag\": \"dns_out_${out_tag}\", \"type\": \"https\", \"server\": \"1.1.1.1\", \"detour\": \"${out_tag}\" }"
+        else
+          echo "      ,\"https://1.1.1.1/dns-query\""
+        fi
       done <<< "$used_outbounds"
     fi
     echo '    ],'
@@ -2123,7 +2223,7 @@ EOF
       local base resolver_tag
       base="$(basename "$f" .json)"
       resolver_tag=""
-      if echo "$used_outbounds_set" | grep -qx "$base"; then
+      if [ "${SB_HAS_DOMAIN_RESOLVER}" -eq 1 ] && echo "$used_outbounds_set" | grep -qx "$base"; then
         case "$base" in
           direct4) resolver_tag="dns_direct4_1" ;;
           direct6) resolver_tag="dns_direct6_1" ;;
