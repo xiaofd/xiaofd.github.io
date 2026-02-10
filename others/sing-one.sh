@@ -543,7 +543,8 @@ ensure_hy2_cert() {
 }
 
 issue_hy2_acme_cert() {
-  local domain token ip_choice ip_addr update_dns cf_zone_id cf_zone_id_input
+  local domain token ip_choice ip_addr update_dns
+  local cf_zone_id cf_zone_id_input cf_account_id cf_account_id_input
   domain="${HY2_DOMAIN:-}"
   if [ -z "$domain" ]; then
     read -r -p "HY2 证书域名(需解析到本机): " domain
@@ -555,10 +556,7 @@ issue_hy2_acme_cert() {
   fi
   [ -z "$token" ] && die "CF Token 不能为空。"
   cf_zone_id="${CF_Zone_ID:-}"
-  read -r -p "Cloudflare Zone ID(可选，Token 无法列出 Zone 时建议填写) [${cf_zone_id}]: " cf_zone_id_input
-  if [ -n "$cf_zone_id_input" ]; then
-    cf_zone_id="$cf_zone_id_input"
-  fi
+  cf_account_id="${CF_Account_ID:-}"
 
   read -r -p "是否自动更新 ${domain} 解析到本机? [y/N]: " update_dns
   case "$update_dns" in
@@ -593,9 +591,24 @@ issue_hy2_acme_cert() {
   if [ -n "$cf_zone_id" ]; then
     export CF_Zone_ID="$cf_zone_id"
   fi
-  /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$domain" --keylength 2048 || die "申请证书失败。"
+  if [ -n "$cf_account_id" ]; then
+    export CF_Account_ID="$cf_account_id"
+  fi
+  if ! /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$domain" --keylength 2048; then
+    if [ -z "$cf_zone_id" ] && [ -z "$cf_account_id" ]; then
+      msg "首次申请失败，可填写 Zone ID 或 Account ID 后重试。"
+      read -r -p "Cloudflare Zone ID(可选): " cf_zone_id_input
+      read -r -p "Cloudflare Account ID(可选): " cf_account_id_input
+      [ -n "$cf_zone_id_input" ] && export CF_Zone_ID="$cf_zone_id_input"
+      [ -n "$cf_account_id_input" ] && export CF_Account_ID="$cf_account_id_input"
+      /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$domain" --keylength 2048 || die "申请证书失败。"
+    else
+      die "申请证书失败。"
+    fi
+  fi
   unset CF_Token
   unset CF_Zone_ID
+  unset CF_Account_ID
   /root/.acme.sh/acme.sh --install-cert -d "$domain" \
     --key-file "$HY2_KEY" \
     --fullchain-file "$HY2_CERT" || die "安装证书失败。"
