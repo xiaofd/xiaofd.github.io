@@ -1732,6 +1732,7 @@ update_inbound_line() {
   local idx="$1" new_port="$2" new_out="$3"
   local tmp
   tmp="$(tmp_path inbounds.list)"
+  : > "$tmp"
   local i=0
   while IFS='|' read -r tag port out remark; do
     [ -z "$tag" ] && continue
@@ -1749,6 +1750,7 @@ remove_inbound_line() {
   local idx="$1"
   local tmp
   tmp="$(tmp_path inbounds.list)"
+  : > "$tmp"
   local i=0
   while IFS='|' read -r tag port out remark; do
     [ -z "$tag" ] && continue

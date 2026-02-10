@@ -2112,6 +2112,7 @@ update_inbound_line() {
   local idx="$1" new_port="$2" new_out="$3"
   local tmp
   tmp="$(tmp_path inbounds.list)"
+  : > "$tmp"
   local i=0
   while IFS='|' read -r tag port out remark proto hy2_pass up down; do
     [ -z "$tag" ] && continue
@@ -2129,6 +2130,7 @@ update_inbound_proto_line() {
   local idx="$1" new_proto="$2" new_pass="$3" new_up="$4" new_down="$5"
   local tmp
   tmp="$(tmp_path inbounds.list)"
+  : > "$tmp"
   local i=0
   while IFS='|' read -r tag port out remark proto hy2_pass up down; do
     [ -z "$tag" ] && continue
@@ -2146,6 +2148,7 @@ remove_inbound_line() {
   local idx="$1"
   local tmp
   tmp="$(tmp_path inbounds.list)"
+  : > "$tmp"
   local i=0
   while IFS='|' read -r tag port out remark proto hy2_pass up down; do
     [ -z "$tag" ] && continue
@@ -2205,8 +2208,11 @@ change_protocol() {
         ;;
     esac
     save_manager_conf
-    read -r -p "HY2 密码: " hy2_pass
-    [ -z "$hy2_pass" ] && die "HY2 密码不能为空。"
+    read -r -p "HY2 密码(留空自动生成): " hy2_pass
+    if [ -z "$hy2_pass" ]; then
+      hy2_pass="$(gen_hy2_password)"
+      msg "已生成 HY2 密码: ${hy2_pass}"
+    fi
     read -r -p "HY2 上行带宽(Mbps，可留空): " up
     read -r -p "HY2 下行带宽(Mbps，可留空): " down
   fi
