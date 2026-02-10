@@ -2280,27 +2280,19 @@ build_config() {
     echo '  "dns": {'
     echo '    "servers": ['
     if [ "${SB_HAS_DNS_NEW}" -eq 1 ]; then
+      echo '      { "tag": "dns_local", "type": "local" },'
       echo '      { "tag": "dns_direct4_1", "type": "https", "server": "1.1.1.1", "detour": "direct4" },'
       echo '      { "tag": "dns_direct4_2", "type": "https", "server": "8.8.8.8", "detour": "direct4" },'
       echo '      { "tag": "dns_direct4_3", "type": "https", "server": "223.5.5.5", "detour": "direct4" },'
       echo '      { "tag": "dns_direct6_1", "type": "https", "server": "2606:4700:4700::1111", "detour": "direct6" },'
       echo '      { "tag": "dns_direct6_2", "type": "https", "server": "2001:4860:4860::8888", "detour": "direct6" }'
     else
+      echo '      { "tag": "dns_local", "address": "local" },'
       echo '      { "tag": "dns_direct4_1", "address": "https://1.1.1.1/dns-query", "detour": "direct4" },'
       echo '      { "tag": "dns_direct4_2", "address": "https://8.8.8.8/dns-query", "detour": "direct4" },'
       echo '      { "tag": "dns_direct4_3", "address": "https://223.5.5.5/dns-query", "detour": "direct4" },'
       echo '      { "tag": "dns_direct6_1", "address": "https://[2606:4700:4700::1111]/dns-query", "detour": "direct6" },'
       echo '      { "tag": "dns_direct6_2", "address": "https://[2001:4860:4860::8888]/dns-query", "detour": "direct6" }'
-    fi
-    if [ -n "$used_outbounds" ]; then
-      while IFS= read -r out_tag; do
-        [ -z "$out_tag" ] && continue
-        if [ "${SB_HAS_DNS_NEW}" -eq 1 ]; then
-          echo "      ,{ \"tag\": \"dns_out_${out_tag}\", \"type\": \"https\", \"server\": \"1.1.1.1\", \"detour\": \"${out_tag}\" }"
-        else
-          echo "      ,{ \"tag\": \"dns_out_${out_tag}\", \"address\": \"https://1.1.1.1/dns-query\", \"detour\": \"${out_tag}\" }"
-        fi
-      done <<< "$used_outbounds"
     fi
     echo '    ],'
     echo '    "rules": ['
@@ -2312,7 +2304,7 @@ build_config() {
           echo '      ,'
         fi
         dns_rule_count=$((dns_rule_count+1))
-        echo "      { \"domain\": [\"$(json_escape "$domain")\"], \"server\": \"${dns_final}\" }"
+        echo "      { \"domain\": [\"$(json_escape "$domain")\"], \"server\": \"dns_local\" }"
       done <<< "$dns_bootstrap_domains"
     fi
     echo '    ],'
@@ -2394,7 +2386,7 @@ EOF
         case "$base" in
           direct4) resolver_tag="dns_direct4_1" ;;
           direct6) resolver_tag="dns_direct6_1" ;;
-          *) resolver_tag="dns_out_${base}" ;;
+          *) resolver_tag="dns_local" ;;
         esac
       fi
       outbound_count=$((outbound_count+1))
@@ -2419,7 +2411,7 @@ EOF
           case "$base" in
             direct4) resolver_tag="dns_direct4_1" ;;
             direct6) resolver_tag="dns_direct6_1" ;;
-            *) resolver_tag="dns_out_${base}" ;;
+            *) resolver_tag="dns_local" ;;
           esac
         fi
         endpoint_count=$((endpoint_count+1))
