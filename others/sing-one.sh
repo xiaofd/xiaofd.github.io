@@ -383,6 +383,11 @@ enable_accel() {
       cat > /etc/sysctl.d/99-singbox-accel.conf <<'EOF'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.forwarding=1
+net.ipv4.conf.default.forwarding=1
+net.ipv6.conf.all.forwarding=1
+net.ipv6.conf.default.forwarding=1
 EOF
       sysctl --system >/dev/null 2>&1 || true
       ;;
@@ -403,6 +408,70 @@ EOF
   esac
 }
 
+apply_tuning_profile() {
+  local choice
+  ui "${C_BOLD}${C_BLUE}网络调优：${C_RESET}"
+  ui "  ${C_YELLOW}1)${C_RESET} 默认(清除脚本调优)"
+  ui "  ${C_YELLOW}2)${C_RESET} 保守(BBR+转发)"
+  ui "  ${C_YELLOW}3)${C_RESET} 激进(高性能参数)"
+  read -r -p "请选择 [1-3]: " choice
+  case "$choice" in
+    1)
+      rm -f /etc/sysctl.d/99-singbox-accel.conf
+      sysctl --system >/dev/null 2>&1 || true
+      msg "已恢复默认(删除脚本调优)。"
+      ;;
+    2)
+      modprobe tcp_bbr >/dev/null 2>&1 || true
+      cat > /etc/sysctl.d/99-singbox-accel.conf <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.forwarding=1
+net.ipv4.conf.default.forwarding=1
+net.ipv6.conf.all.forwarding=1
+net.ipv6.conf.default.forwarding=1
+EOF
+      sysctl --system >/dev/null 2>&1 || true
+      msg "已应用保守调优。"
+      ;;
+    3)
+      modprobe tcp_bbr >/dev/null 2>&1 || true
+      cat > /etc/sysctl.d/99-singbox-accel.conf <<'EOF'
+fs.file-max = 6815744
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.tcp_ecn=0
+net.ipv4.tcp_frto=0
+net.ipv4.tcp_mtu_probing=0
+net.ipv4.tcp_rfc1337=0
+net.ipv4.tcp_sack=1
+net.ipv4.tcp_fack=1
+net.ipv4.tcp_window_scaling=1
+net.ipv4.tcp_adv_win_scale=1
+net.ipv4.tcp_moderate_rcvbuf=1
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.ipv4.tcp_rmem=4096 87380 33554432
+net.ipv4.tcp_wmem=4096 16384 33554432
+net.ipv4.udp_rmem_min=8192
+net.ipv4.udp_wmem_min=8192
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.route_localnet=1
+net.ipv4.conf.all.forwarding=1
+net.ipv4.conf.default.forwarding=1
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv6.conf.all.forwarding=1
+net.ipv6.conf.default.forwarding=1
+EOF
+      sysctl --system >/dev/null 2>&1 || true
+      msg "已应用激进调优。"
+      ;;
+    *)
+      msg "已取消。"
+      ;;
+  esac
+}
 gen_short_id() {
   if cmd_exists od; then
     od -An -N8 -tx1 /dev/urandom | tr -d ' \n'
@@ -3045,6 +3114,7 @@ main_menu() {
       menu_item 9 "查看运行状态"
       menu_item 10 "重启服务"
       menu_item 11 "卸载"
+      menu_item 12 "网络调优"
       menu_item 0 "退出"
       read -r -p "请选择: " choice
       if [ ! -f "$MANAGER_CONF" ] && [ "$choice" != "1" ] && [ "$choice" != "0" ] && [ "$choice" != "11" ]; then
@@ -3063,6 +3133,7 @@ main_menu() {
         9) show_status ;;
         10) restart_service ;;
         11) uninstall_all ;;
+        12) apply_tuning_profile ;;
         0) exit 0 ;;
       esac
     else
