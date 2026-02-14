@@ -3113,8 +3113,8 @@ main_menu() {
       menu_item 8 "显示连接信息"
       menu_item 9 "查看运行状态"
       menu_item 10 "重启服务"
-      menu_item 11 "卸载"
-      menu_item 12 "网络调优"
+      menu_item 11 "网络调优切换"
+      menu_item 12 "卸载"
       menu_item 0 "退出"
       read -r -p "请选择: " choice
       if [ ! -f "$MANAGER_CONF" ] && [ "$choice" != "1" ] && [ "$choice" != "0" ] && [ "$choice" != "11" ]; then
@@ -3132,8 +3132,8 @@ main_menu() {
         8) show_info ;;
         9) show_status ;;
         10) restart_service ;;
-        11) uninstall_all ;;
-        12) apply_tuning_profile ;;
+        11) apply_tuning_profile ;;
+        12) uninstall_all ;;
         0) exit 0 ;;
       esac
     else
