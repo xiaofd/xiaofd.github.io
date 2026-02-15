@@ -32,6 +32,7 @@ DEFAULT_HY2_MASQUERADE="https://www.cloudflare.com"
 AUTO_PROTO=""
 SB_HAS_DNS_NEW=""
 SB_HAS_DOMAIN_RESOLVER=""
+SB_HAS_ROUTE_DEFAULT_DOMAIN_RESOLVER=""
 SB_HAS_WG_NEW=""
 SB_HAS_HY2_MASQ=""
 SB_HAS_HY2_IGNORE_BW=""
@@ -383,13 +384,16 @@ enable_accel() {
       cat > /etc/sysctl.d/99-singbox-accel.conf <<'EOF'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
+fs.inotify.max_user_instances=1024
+fs.inotify.max_user_watches=1048576
+fs.inotify.max_queued_events=65536
 net.ipv4.ip_forward=1
 net.ipv4.conf.all.forwarding=1
 net.ipv4.conf.default.forwarding=1
 net.ipv6.conf.all.forwarding=1
 net.ipv6.conf.default.forwarding=1
 EOF
-      sysctl --system >/dev/null 2>&1 || true
+      apply_sysctl_changes /etc/sysctl.d/99-singbox-accel.conf
       ;;
     lxc|container)
       if [ -r /proc/sys/net/ipv4/tcp_available_congestion_control ] && \
@@ -403,9 +407,39 @@ EOF
 net.core.default_qdisc=${qdisc}
 net.ipv4.tcp_congestion_control=${cc}
 EOF
-      sysctl --system >/dev/null 2>&1 || true
+      apply_sysctl_changes /etc/sysctl.d/99-singbox-accel.conf
       ;;
   esac
+}
+
+show_tuning_effective() {
+  msg "当前内核参数："
+  msg "  net.core.default_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo N/A)"
+  msg "  net.ipv4.tcp_congestion_control=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo N/A)"
+  msg "  fs.inotify.max_user_instances=$(sysctl -n fs.inotify.max_user_instances 2>/dev/null || echo N/A)"
+  msg "  fs.inotify.max_user_watches=$(sysctl -n fs.inotify.max_user_watches 2>/dev/null || echo N/A)"
+  msg "  fs.inotify.max_queued_events=$(sysctl -n fs.inotify.max_queued_events 2>/dev/null || echo N/A)"
+  msg "  net.ipv4.ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo N/A)"
+  msg "  net.ipv6.conf.all.forwarding=$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo N/A)"
+}
+
+apply_sysctl_changes() {
+  local profile="${1:-}" out rc=0
+  if [ -n "$profile" ] && [ -f "$profile" ]; then
+    out="$(sysctl -p "$profile" 2>&1)" || rc=$?
+  else
+    out="$(sysctl --system 2>&1)" || rc=$?
+  fi
+  if [ "$rc" -eq 0 ]; then
+    msg "sysctl 应用成功。"
+  else
+    ui "sysctl 返回非 0 (可能部分键在当前环境不可用): ${rc}"
+  fi
+  if [ -n "$out" ]; then
+    msg "sysctl 输出："
+    printf '%s\n' "$out" | sed 's/^/  /'
+  fi
+  show_tuning_effective
 }
 
 apply_tuning_profile() {
@@ -418,7 +452,7 @@ apply_tuning_profile() {
   case "$choice" in
     1)
       rm -f /etc/sysctl.d/99-singbox-accel.conf
-      sysctl --system >/dev/null 2>&1 || true
+      apply_sysctl_changes
       msg "已恢复默认(删除脚本调优)。"
       ;;
     2)
@@ -426,19 +460,25 @@ apply_tuning_profile() {
       cat > /etc/sysctl.d/99-singbox-accel.conf <<'EOF'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
+fs.inotify.max_user_instances=1024
+fs.inotify.max_user_watches=1048576
+fs.inotify.max_queued_events=65536
 net.ipv4.ip_forward=1
 net.ipv4.conf.all.forwarding=1
 net.ipv4.conf.default.forwarding=1
 net.ipv6.conf.all.forwarding=1
 net.ipv6.conf.default.forwarding=1
 EOF
-      sysctl --system >/dev/null 2>&1 || true
+      apply_sysctl_changes /etc/sysctl.d/99-singbox-accel.conf
       msg "已应用保守调优。"
       ;;
     3)
       modprobe tcp_bbr >/dev/null 2>&1 || true
       cat > /etc/sysctl.d/99-singbox-accel.conf <<'EOF'
 fs.file-max = 6815744
+fs.inotify.max_user_instances=1024
+fs.inotify.max_user_watches=1048576
+fs.inotify.max_queued_events=65536
 net.ipv4.tcp_no_metrics_save=1
 net.ipv4.tcp_ecn=0
 net.ipv4.tcp_frto=0
@@ -456,7 +496,6 @@ net.ipv4.tcp_wmem=4096 16384 33554432
 net.ipv4.udp_rmem_min=8192
 net.ipv4.udp_wmem_min=8192
 net.ipv4.ip_forward=1
-net.ipv4.conf.all.route_localnet=1
 net.ipv4.conf.all.forwarding=1
 net.ipv4.conf.default.forwarding=1
 net.core.default_qdisc=fq
@@ -464,7 +503,7 @@ net.ipv4.tcp_congestion_control=bbr
 net.ipv6.conf.all.forwarding=1
 net.ipv6.conf.default.forwarding=1
 EOF
-      sysctl --system >/dev/null 2>&1 || true
+      apply_sysctl_changes /etc/sysctl.d/99-singbox-accel.conf
       msg "已应用激进调优。"
       ;;
     *)
@@ -606,15 +645,13 @@ ensure_direct_outbounds() {
   cat > "${OUTBOUNDS_DIR}/direct4.json" <<'EOF'
 {
   "type": "direct",
-  "tag": "direct4",
-  "domain_strategy": "ipv4_only"
+  "tag": "direct4"
 }
 EOF
   cat > "${OUTBOUNDS_DIR}/direct6.json" <<'EOF'
 {
   "type": "direct",
-  "tag": "direct6",
-  "domain_strategy": "ipv6_only"
+  "tag": "direct6"
 }
 EOF
 }
@@ -1100,6 +1137,7 @@ detect_singbox_features() {
   [ -n "${SB_HAS_DNS_NEW:-}" ] && return 0
   SB_HAS_DNS_NEW=1
   SB_HAS_DOMAIN_RESOLVER=1
+  SB_HAS_ROUTE_DEFAULT_DOMAIN_RESOLVER=1
   SB_HAS_WG_NEW=1
   SB_HAS_HY2_MASQ=1
   SB_HAS_HY2_IGNORE_BW=1
@@ -1146,6 +1184,22 @@ EOF
     fi
   else
     SB_HAS_DOMAIN_RESOLVER=0
+  fi
+
+  if [ "${SB_HAS_DNS_NEW}" -eq 1 ]; then
+    cat > "$t" <<'EOF'
+{
+  "log": {"level":"warn"},
+  "dns": {"servers": [{"tag":"dns_probe","type":"https","server":"1.1.1.1"}]},
+  "route": {"default_domain_resolver":"dns_probe"},
+  "outbounds": [{"type":"direct","tag":"direct"}]
+}
+EOF
+    if ! singbox_check_config "$t"; then
+      SB_HAS_ROUTE_DEFAULT_DOMAIN_RESOLVER=0
+    fi
+  else
+    SB_HAS_ROUTE_DEFAULT_DOMAIN_RESOLVER=0
   fi
 
   cat > "$t" <<'EOF'
@@ -2734,13 +2788,20 @@ EOF
     used_outbounds_set="$(printf "%s\n" "$used_outbounds")"
     for f in "${OUTBOUNDS_DIR}"/*.json; do
       [ -e "$f" ] || continue
-      local base resolver_tag
+      local base resolver_tag resolver_strategy
       base="$(basename "$f" .json)"
       resolver_tag=""
+      resolver_strategy="$dns_strategy"
       if [ "${SB_HAS_DOMAIN_RESOLVER}" -eq 1 ] && echo "$used_outbounds_set" | grep -qx "$base"; then
         case "$base" in
-          direct4) resolver_tag="dns_direct4_1" ;;
-          direct6) resolver_tag="dns_direct6_1" ;;
+          direct4)
+            resolver_tag="dns_direct4_1"
+            resolver_strategy="prefer_ipv4"
+            ;;
+          direct6)
+            resolver_tag="dns_direct6_1"
+            resolver_strategy="prefer_ipv6"
+            ;;
           *) resolver_tag="dns_local" ;;
         esac
       fi
@@ -2749,7 +2810,7 @@ EOF
         echo '    ,'
       fi
       if [ -n "$resolver_tag" ]; then
-        emit_outbound_with_resolver "$f" "$resolver_tag" "$dns_strategy"
+        emit_outbound_with_resolver "$f" "$resolver_tag" "$resolver_strategy"
       else
         sed 's/^/    /' "$f"
       fi
@@ -2759,13 +2820,20 @@ EOF
       echo '  "endpoints": ['
       for f in "${ENDPOINTS_DIR}"/*.json; do
         [ -e "$f" ] || continue
-        local base resolver_tag
+        local base resolver_tag resolver_strategy
         base="$(basename "$f" .json)"
         resolver_tag=""
+        resolver_strategy="$dns_strategy"
         if [ "${SB_HAS_DOMAIN_RESOLVER}" -eq 1 ] && echo "$used_outbounds_set" | grep -qx "$base"; then
           case "$base" in
-            direct4) resolver_tag="dns_direct4_1" ;;
-            direct6) resolver_tag="dns_direct6_1" ;;
+            direct4)
+              resolver_tag="dns_direct4_1"
+              resolver_strategy="prefer_ipv4"
+              ;;
+            direct6)
+              resolver_tag="dns_direct6_1"
+              resolver_strategy="prefer_ipv6"
+              ;;
             *) resolver_tag="dns_local" ;;
           esac
         fi
@@ -2774,7 +2842,7 @@ EOF
           echo '    ,'
         fi
         if [ -n "$resolver_tag" ]; then
-          emit_outbound_with_resolver "$f" "$resolver_tag" "$dns_strategy"
+          emit_outbound_with_resolver "$f" "$resolver_tag" "$resolver_strategy"
         else
           sed 's/^/    /' "$f"
         fi
@@ -2783,6 +2851,9 @@ EOF
     fi
     echo '  "route": {'
     echo '    "auto_detect_interface": true,'
+    if [ "${SB_HAS_ROUTE_DEFAULT_DOMAIN_RESOLVER}" -eq 1 ]; then
+      echo '    "default_domain_resolver": "dns_local",'
+    fi
     echo '    "rules": ['
     while IFS='|' read -r tag port out remark proto hy2_pass up down hy2_obfs hy2_masq; do
       [ -z "$tag" ] && continue
@@ -3012,6 +3083,8 @@ uninstall_all() {
     rm -f "$OPENRC_SERVICE"
   fi
   rm -rf "$CONFIG_DIR"
+  rm -f /etc/sysctl.d/99-singbox-accel.conf
+  sysctl --system >/dev/null 2>&1 || true
   rm -f "$SB_BIN"
   rm -f "$LOGROTATE_FILE"
   rm -f "$PID_FILE"
@@ -3117,7 +3190,7 @@ main_menu() {
       menu_item 12 "卸载"
       menu_item 0 "退出"
       read -r -p "请选择: " choice
-      if [ ! -f "$MANAGER_CONF" ] && [ "$choice" != "1" ] && [ "$choice" != "0" ] && [ "$choice" != "11" ]; then
+      if [ ! -f "$MANAGER_CONF" ] && [ "$choice" != "1" ] && [ "$choice" != "0" ] && [ "$choice" != "11" ] && [ "$choice" != "12" ]; then
         msg "请先通过“新增入口”初始化基础配置。"
         continue
       fi
