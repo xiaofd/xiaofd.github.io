@@ -11,6 +11,7 @@ CONFIG_DIR="/etc/xray"
 MANAGER_CONF="${CONFIG_DIR}/manager.conf"
 INBOUNDS_FILE="${CONFIG_DIR}/inbounds.list"
 OUTBOUNDS_DIR="${CONFIG_DIR}/outbounds.d"
+FEATURE_ROUTES_FILE="${CONFIG_DIR}/feature-routes.list"
 SERVICE_FILE="/etc/systemd/system/xray.service"
 LOGROTATE_FILE="/etc/logrotate.d/xray"
 PID_FILE="/run/xray.pid"
@@ -1479,6 +1480,7 @@ get_wgcf_version() {
 setup_warp() {
   local ver arch url priv addr peer_pub endpoint mtu reserved addr4 addr6 res_json
   if [ -f "${OUTBOUNDS_DIR}/warp.json" ]; then
+    ensure_warp_variants
     return 0
   fi
   ensure_tmp_dir
@@ -1534,6 +1536,23 @@ EOF
   mkdir -p "${CONFIG_DIR}/warp"
   cp "${WGCF_DIR}/wgcf-account.toml" "${CONFIG_DIR}/warp/" || true
   cp "${WGCF_DIR}/wgcf-profile.conf" "${CONFIG_DIR}/warp/" || true
+  ensure_warp_variants
+}
+
+ensure_warp_variants() {
+  local tmp
+  if [ ! -f "${OUTBOUNDS_DIR}/warp.json" ]; then
+    return 1
+  fi
+  tmp="$(tmp_path warp4.json)"
+  sed '0,/"tag"[[:space:]]*:[[:space:]]*"warp"/s//"tag": "warp4"/' "${OUTBOUNDS_DIR}/warp.json" \
+    | sed '0,/"settings"[[:space:]]*:[[:space:]]*{/s//"settings": {\n    "domainStrategy": "ForceIPv4",/' > "$tmp"
+  mv "$tmp" "${OUTBOUNDS_DIR}/warp4.json"
+
+  tmp="$(tmp_path warp6.json)"
+  sed '0,/"tag"[[:space:]]*:[[:space:]]*"warp"/s//"tag": "warp6"/' "${OUTBOUNDS_DIR}/warp.json" \
+    | sed '0,/"settings"[[:space:]]*:[[:space:]]*{/s//"settings": {\n    "domainStrategy": "ForceIPv6",/' > "$tmp"
+  mv "$tmp" "${OUTBOUNDS_DIR}/warp6.json"
 }
 
 list_custom_outbounds() {
@@ -1542,7 +1561,7 @@ list_custom_outbounds() {
     [ -e "$f" ] || continue
     base="$(basename "$f" .json)"
     case "$base" in
-      direct4|direct6|warp) continue ;;
+      direct4|direct6|warp|warp4|warp6) continue ;;
     esac
     echo "$base"
   done
@@ -1568,16 +1587,107 @@ has_custom_outbounds() {
     [ -e "$f" ] || continue
     base="$(basename "$f" .json)"
     case "$base" in
-      direct4|direct6|warp) continue ;;
+      direct4|direct6|warp|warp4|warp6) continue ;;
       *) return 0 ;;
     esac
   done
   return 1
 }
 
+ensure_feature_routes_file() {
+  [ -f "$FEATURE_ROUTES_FILE" ] || : > "$FEATURE_ROUTES_FILE"
+}
+
+is_feature_key_valid() {
+  case "$1" in
+    youtube|streaming|ai|google|telegram|github|tiktok|speedtest) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+feature_label() {
+  case "$1" in
+    youtube) echo "YouTube" ;;
+    streaming) echo "流媒体" ;;
+    ai) echo "AI" ;;
+    google) echo "Google" ;;
+    telegram) echo "Telegram" ;;
+    github) echo "GitHub" ;;
+    tiktok) echo "TikTok" ;;
+    speedtest) echo "测速站点" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+feature_domain_suffixes() {
+  case "$1" in
+    youtube) printf '%s\n' youtube.com youtu.be ytimg.com googlevideo.com ;;
+    streaming) printf '%s\n' netflix.com nflxvideo.net nflximg.net disneyplus.com dssott.com bamgrid.com primevideo.com amazonvideo.com hulu.com spotify.com ;;
+    ai) printf '%s\n' openai.com chatgpt.com oaistatic.com oaiusercontent.com anthropic.com claude.ai gemini.google.com generativelanguage.googleapis.com ;;
+    google) printf '%s\n' google.com gstatic.com googleapis.com googleusercontent.com ggpht.com gvt1.com ;;
+    telegram) printf '%s\n' telegram.org t.me tdesktop.com telegram.me ;;
+    github) printf '%s\n' github.com githubusercontent.com githubassets.com ghcr.io ;;
+    tiktok) printf '%s\n' tiktok.com tiktokcdn.com tiktokv.com byteoversea.com ;;
+    speedtest) printf '%s\n' speedtest.net fast.com nperf.com speed.cloudflare.com ;;
+    *) ;;
+  esac
+}
+
+feature_xray_domains_json() {
+  local key="$1" first=1 d
+  printf '['
+  while IFS= read -r d; do
+    [ -z "$d" ] && continue
+    if [ "$first" -eq 0 ]; then
+      printf ','
+    fi
+    first=0
+    printf '"domain:%s"' "$(json_escape "$d")"
+  done < <(feature_domain_suffixes "$key")
+  printf ']'
+}
+
+sanitize_feature_routes() {
+  local tmp key out
+  ensure_feature_routes_file
+  tmp="$(tmp_path feature-routes.list)"
+  : > "$tmp"
+  while IFS='|' read -r key out; do
+    [ -z "$key" ] && continue
+    if ! is_feature_key_valid "$key"; then
+      continue
+    fi
+    if [ -z "$out" ] || ! echo "$out" | grep -qE '^[A-Za-z0-9_]+$'; then
+      continue
+    fi
+    echo "${key}|${out}" >> "$tmp"
+  done < "$FEATURE_ROUTES_FILE"
+  awk -F'|' '!seen[$1]++' "$tmp" > "${tmp}.uniq"
+  mv "${tmp}.uniq" "$FEATURE_ROUTES_FILE"
+  rm -f "$tmp"
+}
+
+list_feature_routes() {
+  sanitize_feature_routes
+  [ -s "$FEATURE_ROUTES_FILE" ] || return 1
+  cat "$FEATURE_ROUTES_FILE"
+}
+
+feature_route_uses_outbound() {
+  local tag="$1"
+  sanitize_feature_routes
+  if [ -s "$FEATURE_ROUTES_FILE" ] && awk -F'|' -v t="$tag" '$2==t {found=1} END{exit !found}' "$FEATURE_ROUTES_FILE"; then
+    return 0
+  fi
+  return 1
+}
+
 outbound_in_use() {
   local tag="$1"
   if [ -f "$INBOUNDS_FILE" ] && awk -F'|' -v t="$tag" '$3==t {found=1} END{exit !found}' "$INBOUNDS_FILE"; then
+    return 0
+  fi
+  if feature_route_uses_outbound "$tag"; then
     return 0
   fi
   return 1
@@ -1671,7 +1781,7 @@ delete_custom_outbound() {
   fi
   tag="$(select_existing_custom_outbound)"
   if outbound_in_use "$tag"; then
-    msg "该出口仍被入口使用，请先修改入口出口。"
+    msg "该出口仍被入口/功能分流使用，请先解除引用。"
     return 0
   fi
   rm -f "${OUTBOUNDS_DIR}/${tag}.json"
@@ -1720,6 +1830,151 @@ manage_custom_outbounds() {
   done
 }
 
+choose_feature_key() {
+  local choice
+  ui "${C_BOLD}${C_BLUE}功能分类：${C_RESET}"
+  ui "  ${C_YELLOW}1)${C_RESET} YouTube"
+  ui "  ${C_YELLOW}2)${C_RESET} 流媒体"
+  ui "  ${C_YELLOW}3)${C_RESET} AI"
+  ui "  ${C_YELLOW}4)${C_RESET} Google"
+  ui "  ${C_YELLOW}5)${C_RESET} Telegram"
+  ui "  ${C_YELLOW}6)${C_RESET} GitHub"
+  ui "  ${C_YELLOW}7)${C_RESET} TikTok"
+  ui "  ${C_YELLOW}8)${C_RESET} 测速站点"
+  while true; do
+    read -r -p "请选择: " choice
+    case "$choice" in
+      1) echo "youtube"; return 0 ;;
+      2) echo "streaming"; return 0 ;;
+      3) echo "ai"; return 0 ;;
+      4) echo "google"; return 0 ;;
+      5) echo "telegram"; return 0 ;;
+      6) echo "github"; return 0 ;;
+      7) echo "tiktok"; return 0 ;;
+      8) echo "speedtest"; return 0 ;;
+    esac
+  done
+}
+
+set_feature_route() {
+  local key="$1" out="$2" tmp found=0 cur_key cur_out
+  ensure_feature_routes_file
+  sanitize_feature_routes
+  tmp="$(tmp_path feature-routes.list)"
+  : > "$tmp"
+  while IFS='|' read -r cur_key cur_out; do
+    [ -z "$cur_key" ] && continue
+    if [ "$cur_key" = "$key" ]; then
+      echo "${key}|${out}" >> "$tmp"
+      found=1
+    else
+      echo "${cur_key}|${cur_out}" >> "$tmp"
+    fi
+  done < "$FEATURE_ROUTES_FILE"
+  if [ "$found" -eq 0 ]; then
+    echo "${key}|${out}" >> "$tmp"
+  fi
+  mv "$tmp" "$FEATURE_ROUTES_FILE"
+}
+
+delete_feature_route() {
+  local key="$1" tmp cur_key cur_out
+  ensure_feature_routes_file
+  sanitize_feature_routes
+  tmp="$(tmp_path feature-routes.list)"
+  : > "$tmp"
+  while IFS='|' read -r cur_key cur_out; do
+    [ -z "$cur_key" ] && continue
+    [ "$cur_key" = "$key" ] && continue
+    echo "${cur_key}|${cur_out}" >> "$tmp"
+  done < "$FEATURE_ROUTES_FILE"
+  mv "$tmp" "$FEATURE_ROUTES_FILE"
+}
+
+pick_feature_route_key() {
+  local keys=() i=0 choice key out
+  sanitize_feature_routes
+  while IFS='|' read -r key out; do
+    [ -z "$key" ] && continue
+    keys+=("$key")
+  done < "$FEATURE_ROUTES_FILE"
+  [ "${#keys[@]}" -gt 0 ] || return 1
+  ui "现有功能分流："
+  for key in "${keys[@]}"; do
+    i=$((i+1))
+    ui "  ${i}) $(feature_label "$key")"
+  done
+  while true; do
+    read -r -p "请选择: " choice
+    if echo "$choice" | grep -qE '^[0-9]+$' && [ "$choice" -ge 1 ] && [ "$choice" -le "${#keys[@]}" ]; then
+      echo "${keys[$((choice-1))]}"
+      return 0
+    fi
+  done
+}
+
+show_feature_routes() {
+  local key out
+  if ! list_feature_routes >/dev/null 2>&1; then
+    msg "暂无功能分流规则。"
+    return 0
+  fi
+  msg "功能分流规则："
+  while IFS='|' read -r key out; do
+    [ -z "$key" ] && continue
+    msg "  $(feature_label "$key") -> ${out}"
+  done < "$FEATURE_ROUTES_FILE"
+}
+
+manage_feature_routes() {
+  local choice key route_out
+  ensure_feature_routes_file
+  while true; do
+    ui "${C_BOLD}${C_BLUE}功能分流管理：${C_RESET}"
+    ui "  ${C_YELLOW}1)${C_RESET} 新增/更新功能分流"
+    ui "  ${C_YELLOW}2)${C_RESET} 删除功能分流"
+    ui "  ${C_YELLOW}3)${C_RESET} 查看功能分流"
+    ui "  ${C_YELLOW}4)${C_RESET} 清空功能分流"
+    ui "  ${C_YELLOW}0)${C_RESET} 返回"
+    read -r -p "请选择: " choice
+    case "$choice" in
+      1)
+        key="$(choose_feature_key)"
+        route_out="$(choose_outbound)"
+        set_feature_route "$key" "$route_out"
+        if [ -s "$INBOUNDS_FILE" ]; then
+          build_config
+          restart_xray
+        fi
+        msg "功能分流已设置: $(feature_label "$key") -> ${route_out}"
+        ;;
+      2)
+        if ! list_feature_routes >/dev/null 2>&1; then
+          msg "暂无功能分流规则。"
+          continue
+        fi
+        key="$(pick_feature_route_key)" || continue
+        delete_feature_route "$key"
+        if [ -s "$INBOUNDS_FILE" ]; then
+          build_config
+          restart_xray
+        fi
+        msg "功能分流已删除: $(feature_label "$key")"
+        ;;
+      3) show_feature_routes ;;
+      4)
+        : > "$FEATURE_ROUTES_FILE"
+        if [ -s "$INBOUNDS_FILE" ]; then
+          build_config
+          restart_xray
+        fi
+        msg "功能分流规则已清空。"
+        ;;
+      0) return 0 ;;
+    esac
+  done
+}
+
 choose_outbound() {
   local choice tag has_custom
   ensure_direct_outbounds
@@ -1731,17 +1986,21 @@ choose_outbound() {
   ui "${C_BOLD}${C_BLUE}出口模式：${C_RESET}"
   ui "  ${C_YELLOW}1)${C_RESET} 本机 IPv4"
   ui "  ${C_YELLOW}2)${C_RESET} 本机 IPv6"
-  ui "  ${C_YELLOW}3)${C_RESET} WARP"
-  ui "  ${C_YELLOW}4)${C_RESET} 新增出口链接"
-  ui "  ${C_YELLOW}5)${C_RESET} 使用已有自定义出口"
+  ui "  ${C_YELLOW}3)${C_RESET} WARP(自动)"
+  ui "  ${C_YELLOW}4)${C_RESET} WARP IPv4"
+  ui "  ${C_YELLOW}5)${C_RESET} WARP IPv6"
+  ui "  ${C_YELLOW}6)${C_RESET} 新增出口链接"
+  ui "  ${C_YELLOW}7)${C_RESET} 使用已有自定义出口"
   while true; do
     read -r -p "请选择: " choice
     case "$choice" in
       1) echo "direct4"; return 0 ;;
       2) echo "direct6"; return 0 ;;
       3) setup_warp 1>&2; echo "warp"; return 0 ;;
-      4) tag="$(add_custom_outbound)"; echo "$tag"; return 0 ;;
-      5)
+      4) setup_warp 1>&2; echo "warp4"; return 0 ;;
+      5) setup_warp 1>&2; echo "warp6"; return 0 ;;
+      6) tag="$(add_custom_outbound)"; echo "$tag"; return 0 ;;
+      7)
         if [ "$has_custom" -eq 1 ]; then
           tag="$(select_existing_custom_outbound)"
           echo "$tag"
@@ -1912,6 +2171,7 @@ build_config() {
   load_manager_conf
   ensure_direct_outbounds
   sanitize_inbounds
+  sanitize_feature_routes
 
   if [ ! -s "$INBOUNDS_FILE" ]; then
     die "未配置任何入口。"
@@ -1923,8 +2183,10 @@ build_config() {
     dns_query_strategy="UseIPv6"
   fi
   tmp="$(tmp_path config.json)"
-  local used_outbounds dns_bootstrap_domains
-  used_outbounds="$(awk -F'|' 'NF>=3{print $3}' "$INBOUNDS_FILE" | awk '!seen[$0]++')"
+  local used_outbounds dns_bootstrap_domains inbound_used_outbounds feature_used_outbounds
+  inbound_used_outbounds="$(awk -F'|' 'NF>=3{print $3}' "$INBOUNDS_FILE")"
+  feature_used_outbounds="$(awk -F'|' 'NF>=2{print $2}' "$FEATURE_ROUTES_FILE" 2>/dev/null || true)"
+  used_outbounds="$(printf "%s\n%s\n" "$inbound_used_outbounds" "$feature_used_outbounds" | awk 'NF>0 && !seen[$0]++')"
   dns_bootstrap_domains=""
   if [ -n "$used_outbounds" ]; then
     while IFS= read -r out_tag; do
@@ -1944,6 +2206,8 @@ build_config() {
     fi
   fi
   local inbound_count=0 outbound_count=0 rule_count=0
+  local inbound_tags_json
+  inbound_tags_json="$(awk -F'|' 'BEGIN{printf "["} NF>=1 && $1!="" {if(n++) printf ","; printf "\"%s\"", $1} END{printf "]"}' "$INBOUNDS_FILE")"
   {
     echo '{'
     echo '  "log": {'
@@ -2029,6 +2293,30 @@ EOF
     echo '  "routing": {'
     echo '    "domainStrategy": "IPIfNonMatch",'
     echo '    "rules": ['
+    if [ -s "$FEATURE_ROUTES_FILE" ]; then
+      while IFS='|' read -r fkey fout; do
+        [ -z "$fkey" ] && continue
+        [ -z "$fout" ] && continue
+        if [ ! -f "${OUTBOUNDS_DIR}/${fout}.json" ]; then
+          continue
+        fi
+        local domains_json
+        domains_json="$(feature_xray_domains_json "$fkey")"
+        [ -z "$domains_json" ] && continue
+        rule_count=$((rule_count+1))
+        if [ "$rule_count" -gt 1 ]; then
+          echo '      ,'
+        fi
+        cat <<EOF
+      {
+        "type": "field",
+        "inboundTag": ${inbound_tags_json},
+        "domain": ${domains_json},
+        "outboundTag": "$(json_escape "$fout")"
+      }
+EOF
+      done < "$FEATURE_ROUTES_FILE"
+    fi
     while IFS='|' read -r tag port out remark; do
       [ -z "$tag" ] && continue
       if [ ! -f "${OUTBOUNDS_DIR}/${out}.json" ]; then
@@ -2279,9 +2567,10 @@ main_menu() {
       menu_item 10 "重启服务"
       menu_item 11 "网络调优切换"
       menu_item 12 "卸载"
+      menu_item 13 "功能分流管理"
       menu_item 0 "退出"
       read -r -p "请选择: " choice
-      if [ ! -f "$MANAGER_CONF" ] && [ "$choice" != "1" ] && [ "$choice" != "0" ] && [ "$choice" != "11" ] && [ "$choice" != "12" ]; then
+      if [ ! -f "$MANAGER_CONF" ] && [ "$choice" != "1" ] && [ "$choice" != "0" ] && [ "$choice" != "11" ] && [ "$choice" != "12" ] && [ "$choice" != "13" ]; then
         msg "请先通过“新增入口”初始化基础配置。"
         continue
       fi
@@ -2298,6 +2587,7 @@ main_menu() {
         10) restart_service ;;
         11) apply_tuning_profile ;;
         12) uninstall_all ;;
+        13) manage_feature_routes ;;
         0) exit 0 ;;
       esac
     else
