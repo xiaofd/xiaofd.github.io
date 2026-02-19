@@ -1157,6 +1157,15 @@ get_warp_endpoint_field() {
   echo "|"
 }
 
+warp_profile_endpoint_raw() {
+  local profile endpoint
+  profile="${CONFIG_DIR}/warp/wgcf-profile.conf"
+  [ -f "$profile" ] || return 1
+  endpoint="$(awk -F' = ' '/^Endpoint/ {print $2; exit}' "$profile" | tr -d '[:space:]')"
+  [ -n "$endpoint" ] || return 1
+  printf '%s\n' "$endpoint"
+}
+
 get_outbound_domains() {
   local tag="$1" f
   if [ -f "${OUTBOUNDS_DIR}/${tag}.json" ]; then
@@ -1167,7 +1176,7 @@ get_outbound_domains() {
     f=""
   fi
   if [ -n "$f" ]; then
-    for key in server address server_name serverName sni host Host; do
+    for key in server address endpoint server_name serverName sni host Host; do
       sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\\([^\"]\\+\\)\".*/\\1/p" "$f"
     done
   fi
@@ -2056,6 +2065,21 @@ setup_warp() {
   if ! echo "$endpoint_port" | grep -qE '^[0-9]+$'; then
     endpoint_port="2408"
   fi
+  if ! is_ip_addr "$endpoint_host"; then
+    local endpoint_resolved=""
+    if ipv6_only; then
+      endpoint_resolved="$(resolve_domain_ipv6 "$endpoint_host" || true)"
+      [ -z "$endpoint_resolved" ] && endpoint_resolved="$(resolve_domain_ipv4 "$endpoint_host" || true)"
+    else
+      endpoint_resolved="$(resolve_domain_ipv4 "$endpoint_host" || true)"
+      [ -z "$endpoint_resolved" ] && endpoint_resolved="$(resolve_domain_ipv6 "$endpoint_host" || true)"
+    fi
+    if [ -n "$endpoint_resolved" ]; then
+      endpoint_host="$endpoint_resolved"
+    else
+      ui "提示: WARP 主出口未解析到固定 IP，继续使用域名端点。"
+    fi
+  fi
 
   local warp_endpoint_new_tmp warp_endpoint_legacy_tmp warp_new_tmp warp_old_tmp
   warp_endpoint_new_tmp="$(tmp_path warp.endpoint.new.json)"
@@ -2191,7 +2215,7 @@ EOF
 }
 
 ensure_warp_variants() {
-  local base_file target_dir tmp tag field_mode field_raw resolved family esc
+  local base_file target_dir tmp tag field_mode field_raw resolved family esc profile_raw
   if [ -f "${ENDPOINTS_DIR}/warp.json" ]; then
     base_file="${ENDPOINTS_DIR}/warp.json"
     target_dir="${ENDPOINTS_DIR}"
@@ -2202,6 +2226,10 @@ ensure_warp_variants() {
     return 1
   fi
   IFS='|' read -r field_mode field_raw <<< "$(get_warp_endpoint_field "$base_file")"
+  profile_raw="$(warp_profile_endpoint_raw || true)"
+  if [ -n "$profile_raw" ]; then
+    field_raw="$profile_raw"
+  fi
   for tag in warp4 warp6; do
     tmp="$(tmp_path ${tag}.json)"
     sed '0,/"tag"[[:space:]]*:[[:space:]]*"warp"/s//"tag": "'"${tag}"'"/' "$base_file" > "$tmp"
@@ -3056,6 +3084,9 @@ build_config() {
   if [ -n "$used_outbounds" ]; then
     while IFS= read -r out_tag; do
       [ -z "$out_tag" ] && continue
+      case "$out_tag" in
+        warp|warp4|warp6) dns_bootstrap_domains="${dns_bootstrap_domains}engage.cloudflareclient.com\n" ;;
+      esac
       while IFS= read -r raw_srv; do
         local srv
         [ -z "$raw_srv" ] && continue

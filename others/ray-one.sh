@@ -838,6 +838,15 @@ warp_endpoint_for_family() {
   return 0
 }
 
+warp_profile_endpoint_raw() {
+  local profile endpoint
+  profile="${CONFIG_DIR}/warp/wgcf-profile.conf"
+  [ -f "$profile" ] || return 1
+  endpoint="$(awk -F' = ' '/^Endpoint/ {print $2; exit}' "$profile" | tr -d '[:space:]')"
+  [ -n "$endpoint" ] || return 1
+  printf '%s\n' "$endpoint"
+}
+
 get_outbound_domains() {
   local tag="$1" f
   if [ -f "${OUTBOUNDS_DIR}/${tag}.json" ]; then
@@ -846,7 +855,7 @@ get_outbound_domains() {
     f=""
   fi
   if [ -n "$f" ]; then
-    for key in server address server_name serverName sni host Host; do
+    for key in server address endpoint server_name serverName sni host Host; do
       sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\\([^\"]\\+\\)\".*/\\1/p" "$f"
     done
   fi
@@ -1547,6 +1556,7 @@ get_wgcf_version() {
 
 setup_warp() {
   local ver arch url priv addr peer_pub endpoint mtu reserved addr4 addr6 res_json
+  local endpoint_host endpoint_port endpoint_resolved
   if [ -f "${OUTBOUNDS_DIR}/warp.json" ]; then
     ensure_warp_variants
     return 0
@@ -1582,6 +1592,31 @@ setup_warp() {
   else
     res_json=""
   fi
+  IFS='|' read -r endpoint_host endpoint_port <<< "$(parse_hostport "$endpoint")"
+  [ -z "$endpoint_host" ] && endpoint_host="engage.cloudflareclient.com"
+  [ -z "$endpoint_port" ] && endpoint_port="2408"
+  if ! echo "$endpoint_port" | grep -qE '^[0-9]+$'; then
+    endpoint_port="2408"
+  fi
+  if ! is_ip_addr "$endpoint_host"; then
+    if ipv6_only; then
+      endpoint_resolved="$(resolve_domain_ipv6 "$endpoint_host" || true)"
+      [ -z "$endpoint_resolved" ] && endpoint_resolved="$(resolve_domain_ipv4 "$endpoint_host" || true)"
+    else
+      endpoint_resolved="$(resolve_domain_ipv4 "$endpoint_host" || true)"
+      [ -z "$endpoint_resolved" ] && endpoint_resolved="$(resolve_domain_ipv6 "$endpoint_host" || true)"
+    fi
+    if [ -n "$endpoint_resolved" ]; then
+      endpoint_host="$endpoint_resolved"
+    else
+      ui "提示: WARP 主出口未解析到固定 IP，继续使用域名端点。"
+    fi
+  fi
+  if echo "$endpoint_host" | grep -q ':'; then
+    endpoint="[${endpoint_host}]:${endpoint_port}"
+  else
+    endpoint="${endpoint_host}:${endpoint_port}"
+  fi
 
   cat > "${OUTBOUNDS_DIR}/warp.json" <<EOF
 {
@@ -1608,25 +1643,28 @@ EOF
 }
 
 ensure_warp_variants() {
-  local tmp endpoint_raw ep4 ep6 force4 force6 ep4_esc ep6_esc
+  local tmp endpoint_raw endpoint_fallback endpoint_profile ep4 ep6 force4 force6 ep4_esc ep6_esc
   if [ ! -f "${OUTBOUNDS_DIR}/warp.json" ]; then
     return 1
   fi
-  endpoint_raw="$(sed -n 's/.*"endpoint"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*/\1/p' "${OUTBOUNDS_DIR}/warp.json" | head -n1)"
+  endpoint_fallback="$(sed -n 's/.*"endpoint"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*/\1/p' "${OUTBOUNDS_DIR}/warp.json" | head -n1)"
+  endpoint_profile="$(warp_profile_endpoint_raw || true)"
+  endpoint_raw="${endpoint_profile:-$endpoint_fallback}"
+  [ -z "$endpoint_fallback" ] && endpoint_fallback="$endpoint_raw"
   force4=1
   force6=1
-  ep4="$endpoint_raw"
-  ep6="$endpoint_raw"
+  ep4="$endpoint_fallback"
+  ep6="$endpoint_fallback"
   if [ -n "$endpoint_raw" ]; then
     ep4="$(warp_endpoint_for_family "$endpoint_raw" 4 || true)"
     if [ -z "$ep4" ]; then
-      ep4="$endpoint_raw"
+      ep4="$endpoint_fallback"
       force4=0
       ui "提示: WARP IPv4 未解析到 IPv4 端点，warp4 将使用自动地址族。"
     fi
     ep6="$(warp_endpoint_for_family "$endpoint_raw" 6 || true)"
     if [ -z "$ep6" ]; then
-      ep6="$endpoint_raw"
+      ep6="$endpoint_fallback"
       force6=0
       ui "提示: WARP IPv6 未解析到 IPv6 端点，warp6 将使用自动地址族。"
     fi
@@ -2287,6 +2325,9 @@ build_config() {
   if [ -n "$used_outbounds" ]; then
     while IFS= read -r out_tag; do
       [ -z "$out_tag" ] && continue
+      case "$out_tag" in
+        warp|warp4|warp6) dns_bootstrap_domains="${dns_bootstrap_domains}engage.cloudflareclient.com\n" ;;
+      esac
       while IFS= read -r raw_srv; do
         local srv
         [ -z "$raw_srv" ] && continue
@@ -2314,7 +2355,7 @@ build_config() {
     echo '  "dns": {'
     echo '    "servers": ['
     if [ -n "$dns_bootstrap_domains" ]; then
-      echo '      { "address": "https://1.1.1.1/dns-query", "domains": ['
+      echo '      { "address": "localhost", "domains": ['
       local dns_domain_count=0
       while IFS= read -r domain; do
         [ -z "$domain" ] && continue
