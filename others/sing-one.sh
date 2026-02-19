@@ -642,6 +642,22 @@ load_manager_conf() {
   return 0
 }
 
+ensure_reality_material() {
+  local changed=0
+  [ -n "${UUID:-}" ] || { UUID="$(gen_uuid)"; changed=1; }
+  [ -n "${SHORT_ID:-}" ] || { SHORT_ID="$(gen_short_id)"; changed=1; }
+  [ -n "${FINGERPRINT:-}" ] || { FINGERPRINT="chrome"; changed=1; }
+  [ -n "${SERVER_NAME:-}" ] || { SERVER_NAME="${DEFAULT_SNI}"; changed=1; }
+  [ -n "${DEST:-}" ] || { DEST="${SERVER_NAME}:443"; changed=1; }
+  if [ -z "${PRIVATE_KEY:-}" ] || [ -z "${PUBLIC_KEY:-}" ]; then
+    gen_reality_keys
+    changed=1
+  fi
+  if [ "$changed" -eq 1 ]; then
+    save_manager_conf
+  fi
+}
+
 ensure_direct_outbounds() {
   cat > "${OUTBOUNDS_DIR}/direct4.json" <<'EOF'
 {
@@ -2605,8 +2621,12 @@ add_inbound() {
       *) proto="vless" ;;
     esac
   fi
-  if [ "$proto" = "vless" ] && [ ! -f "$MANAGER_CONF" ]; then
-    init_base_config
+  if [ "$proto" = "vless" ]; then
+    if [ ! -f "$MANAGER_CONF" ]; then
+      init_base_config
+    fi
+    load_manager_conf
+    ensure_reality_material
   fi
   if [ "$proto" = "hy2" ] && [ ! -f "$MANAGER_CONF" ]; then
     init_base_config_silent
@@ -2866,6 +2886,9 @@ change_protocol() {
     else
       prompt_hy2_hardening hy2_obfs hy2_masq
     fi
+  else
+    load_manager_conf
+    ensure_reality_material
   fi
   update_inbound_proto_line "$idx" "$proto" "$hy2_pass" "$up" "$down" "$hy2_obfs" "$hy2_masq"
   build_config
@@ -2908,17 +2931,21 @@ build_config() {
   tmp="$(tmp_path config.json)"
   IFS='|' read -r dest_host dest_port <<< "$(split_host_port "$DEST")"
 
-  local hy2_needed=0
+  local hy2_needed=0 vless_needed=0
   while IFS='|' read -r tag port out remark proto hy2_pass up down hy2_obfs hy2_masq; do
     [ -z "$tag" ] && continue
     [ -z "$proto" ] && proto="vless"
     if [ "$proto" = "hy2" ]; then
       hy2_needed=1
-      break
+    else
+      vless_needed=1
     fi
   done < "$INBOUNDS_FILE"
   if [ "$hy2_needed" -eq 1 ]; then
     ensure_hy2_cert
+  fi
+  if [ "$vless_needed" -eq 1 ]; then
+    ensure_reality_material
   fi
 
   local used_outbounds inbound_used_outbounds feature_used_outbounds
@@ -3346,10 +3373,9 @@ init_base_config() {
 init_base_config_silent() {
   need_root
   ensure_dirs
-  UUID=""
-  SHORT_ID=""
-  PRIVATE_KEY=""
-  PUBLIC_KEY=""
+  UUID="$(gen_uuid)"
+  SHORT_ID="$(gen_short_id)"
+  gen_reality_keys
   FINGERPRINT="chrome"
   HY2_CERT_MODE="self"
   HY2_DOMAIN=""
