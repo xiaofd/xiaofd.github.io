@@ -16,6 +16,8 @@ FEATURE_ROUTES_FILE="${CONFIG_DIR}/feature-routes.list"
 HY2_CERT="${CONFIG_DIR}/hy2.crt"
 HY2_KEY="${CONFIG_DIR}/hy2.key"
 SERVICE_FILE="/etc/systemd/system/sing-box.service"
+SERVICE_DROPIN_DIR="/etc/systemd/system/sing-box.service.d"
+SERVICE_DROPIN_FILE="${SERVICE_DROPIN_DIR}/zzzz-onekey.conf"
 LOGROTATE_FILE="/etc/logrotate.d/sing-box"
 PID_FILE="/run/sing-box.pid"
 OPENRC_SERVICE="/etc/init.d/sing-box"
@@ -265,16 +267,24 @@ write_service() {
   cat > "$SERVICE_FILE" <<'EOF'
 [Unit]
 Description=sing-box Service
-After=network.target nss-lookup.target
+After=network-online.target nss-lookup.target
+Wants=network-online.target
 
 [Service]
 User=root
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
 Restart=on-failure
+TasksMax=infinity
 LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
+EOF
+  mkdir -p "$SERVICE_DROPIN_DIR"
+  cat > "$SERVICE_DROPIN_FILE" <<'EOF'
+[Service]
+TasksMax=infinity
+LimitNOFILE=1048576
 EOF
   systemctl daemon-reload
 }
@@ -3392,6 +3402,8 @@ uninstall_all() {
   if systemd_available; then
     systemctl disable sing-box >/dev/null 2>&1 || true
     rm -f "$SERVICE_FILE"
+    rm -f "$SERVICE_DROPIN_FILE"
+    rmdir "$SERVICE_DROPIN_DIR" >/dev/null 2>&1 || true
     systemctl daemon-reload || true
   elif openrc_available; then
     rc-service sing-box stop >/dev/null 2>&1 || true
