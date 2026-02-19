@@ -782,6 +782,62 @@ normalize_domain_candidate() {
   printf '%s\n' "$v"
 }
 
+resolve_domain_ipv4() {
+  local host="$1" ip
+  if cmd_exists getent; then
+    ip="$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1; exit}')"
+    [ -n "$ip" ] && { echo "$ip"; return 0; }
+  fi
+  if cmd_exists curl; then
+    ip="$(curl -fsSL --max-time 6 "https://1.1.1.1/dns-query?name=${host}&type=A" \
+      -H 'accept: application/dns-json' 2>/dev/null \
+      | sed -n 's/.*"Answer":[[][^]]*"data":"\([0-9.]\+\)".*/\1/p' | head -n1)"
+    [ -n "$ip" ] && { echo "$ip"; return 0; }
+  fi
+  return 1
+}
+
+resolve_domain_ipv6() {
+  local host="$1" ip
+  if cmd_exists getent; then
+    ip="$(getent ahostsv6 "$host" 2>/dev/null | awk 'NR==1{print $1; exit}')"
+    [ -n "$ip" ] && { echo "$ip"; return 0; }
+  fi
+  if cmd_exists curl; then
+    ip="$(curl -fsSL --max-time 6 "https://1.1.1.1/dns-query?name=${host}&type=AAAA" \
+      -H 'accept: application/dns-json' 2>/dev/null \
+      | sed -n 's/.*"Answer":[[][^]]*"data":"\([0-9a-fA-F:]\+\)".*/\1/p' | head -n1)"
+    [ -n "$ip" ] && { echo "$ip"; return 0; }
+  fi
+  return 1
+}
+
+warp_endpoint_for_family() {
+  local endpoint="$1" family="$2" host port ip
+  IFS='|' read -r host port <<< "$(parse_hostport "$endpoint")"
+  [ -z "$port" ] && port="2408"
+  if is_ip_addr "$host"; then
+    if [ "$family" = "4" ]; then
+      echo "$host" | grep -q ":" && return 1
+      echo "${host}:${port}"
+      return 0
+    fi
+    echo "$host" | grep -q ":" || return 1
+    echo "[${host}]:${port}"
+    return 0
+  fi
+  if [ "$family" = "4" ]; then
+    ip="$(resolve_domain_ipv4 "$host" || true)"
+    [ -n "$ip" ] || return 1
+    echo "${ip}:${port}"
+    return 0
+  fi
+  ip="$(resolve_domain_ipv6 "$host" || true)"
+  [ -n "$ip" ] || return 1
+  echo "[${ip}]:${port}"
+  return 0
+}
+
 get_outbound_domains() {
   local tag="$1" f
   if [ -f "${OUTBOUNDS_DIR}/${tag}.json" ]; then
@@ -1552,18 +1608,46 @@ EOF
 }
 
 ensure_warp_variants() {
-  local tmp
+  local tmp endpoint_raw ep4 ep6 force4 force6 ep4_esc ep6_esc
   if [ ! -f "${OUTBOUNDS_DIR}/warp.json" ]; then
     return 1
   fi
+  endpoint_raw="$(sed -n 's/.*"endpoint"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*/\1/p' "${OUTBOUNDS_DIR}/warp.json" | head -n1)"
+  force4=1
+  force6=1
+  ep4="$endpoint_raw"
+  ep6="$endpoint_raw"
+  if [ -n "$endpoint_raw" ]; then
+    ep4="$(warp_endpoint_for_family "$endpoint_raw" 4 || true)"
+    if [ -z "$ep4" ]; then
+      ep4="$endpoint_raw"
+      force4=0
+      ui "提示: WARP IPv4 未解析到 IPv4 端点，warp4 将使用自动地址族。"
+    fi
+    ep6="$(warp_endpoint_for_family "$endpoint_raw" 6 || true)"
+    if [ -z "$ep6" ]; then
+      ep6="$endpoint_raw"
+      force6=0
+      ui "提示: WARP IPv6 未解析到 IPv6 端点，warp6 将使用自动地址族。"
+    fi
+  fi
+  ep4_esc="$(printf '%s' "$ep4" | sed 's/[\\/&]/\\&/g')"
+  ep6_esc="$(printf '%s' "$ep6" | sed 's/[\\/&]/\\&/g')"
+
   tmp="$(tmp_path warp4.json)"
   sed '0,/"tag"[[:space:]]*:[[:space:]]*"warp"/s//"tag": "warp4"/' "${OUTBOUNDS_DIR}/warp.json" \
-    | sed '0,/"settings"[[:space:]]*:[[:space:]]*{/s//"settings": {\n    "domainStrategy": "ForceIPv4",/' > "$tmp"
+    | sed "0,/\"endpoint\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/s//\"endpoint\": \"${ep4_esc}\"/" > "$tmp"
+  if [ "$force4" -eq 1 ]; then
+    sed -i '0,/"settings"[[:space:]]*:[[:space:]]*{/s//"settings": {\n    "domainStrategy": "ForceIPv4",/' "$tmp"
+  fi
   mv "$tmp" "${OUTBOUNDS_DIR}/warp4.json"
 
   tmp="$(tmp_path warp6.json)"
   sed '0,/"tag"[[:space:]]*:[[:space:]]*"warp"/s//"tag": "warp6"/' "${OUTBOUNDS_DIR}/warp.json" \
-    | sed '0,/"settings"[[:space:]]*:[[:space:]]*{/s//"settings": {\n    "domainStrategy": "ForceIPv6",/' > "$tmp"
+    | sed "0,/\"endpoint\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/s//\"endpoint\": \"${ep6_esc}\"/" > "$tmp"
+  if [ "$force6" -eq 1 ]; then
+    sed -i '0,/"settings"[[:space:]]*:[[:space:]]*{/s//"settings": {\n    "domainStrategy": "ForceIPv6",/' "$tmp"
+  fi
   mv "$tmp" "${OUTBOUNDS_DIR}/warp6.json"
 }
 
