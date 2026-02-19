@@ -284,6 +284,7 @@ EOF
 start_xray() {
   ensure_dirs
   if systemd_available; then
+    write_service
     systemctl enable --now xray
   elif openrc_available; then
     write_openrc_service
@@ -310,6 +311,7 @@ stop_xray() {
 
 restart_xray() {
   if systemd_available; then
+    write_service
     systemctl enable xray >/dev/null 2>&1 || true
     systemctl restart xray
   elif openrc_available; then
