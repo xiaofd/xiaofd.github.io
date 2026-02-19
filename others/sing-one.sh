@@ -1086,6 +1086,77 @@ normalize_domain_candidate() {
   printf '%s\n' "$v"
 }
 
+resolve_domain_ipv4() {
+  local host="$1" ip
+  if cmd_exists getent; then
+    ip="$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1; exit}')"
+    [ -n "$ip" ] && { echo "$ip"; return 0; }
+  fi
+  if cmd_exists curl; then
+    ip="$(curl -fsSL --max-time 6 "https://1.1.1.1/dns-query?name=${host}&type=A" \
+      -H 'accept: application/dns-json' 2>/dev/null \
+      | sed -n 's/.*"Answer":[[][^]]*"data":"\([0-9.]\+\)".*/\1/p' | head -n1)"
+    [ -n "$ip" ] && { echo "$ip"; return 0; }
+  fi
+  return 1
+}
+
+resolve_domain_ipv6() {
+  local host="$1" ip
+  if cmd_exists getent; then
+    ip="$(getent ahostsv6 "$host" 2>/dev/null | awk 'NR==1{print $1; exit}')"
+    [ -n "$ip" ] && { echo "$ip"; return 0; }
+  fi
+  if cmd_exists curl; then
+    ip="$(curl -fsSL --max-time 6 "https://1.1.1.1/dns-query?name=${host}&type=AAAA" \
+      -H 'accept: application/dns-json' 2>/dev/null \
+      | sed -n 's/.*"Answer":[[][^]]*"data":"\([0-9a-fA-F:]\+\)".*/\1/p' | head -n1)"
+    [ -n "$ip" ] && { echo "$ip"; return 0; }
+  fi
+  return 1
+}
+
+warp_endpoint_host_for_family() {
+  local raw="$1" family="$2" host port ip
+  IFS='|' read -r host port <<< "$(parse_hostport "$raw")"
+  [ -z "$host" ] && host="$raw"
+  if is_ip_addr "$host"; then
+    if [ "$family" = "4" ]; then
+      echo "$host" | grep -q ":" && return 1
+      echo "$host"
+      return 0
+    fi
+    echo "$host" | grep -q ":" || return 1
+    echo "$host"
+    return 0
+  fi
+  if [ "$family" = "4" ]; then
+    ip="$(resolve_domain_ipv4 "$host" || true)"
+    [ -n "$ip" ] || return 1
+    echo "$ip"
+    return 0
+  fi
+  ip="$(resolve_domain_ipv6 "$host" || true)"
+  [ -n "$ip" ] || return 1
+  echo "$ip"
+  return 0
+}
+
+get_warp_endpoint_field() {
+  local file="$1" v
+  v="$(sed -n 's/.*"server"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*/\1/p' "$file" | head -n1)"
+  if [ -n "$v" ]; then
+    echo "server|$v"
+    return 0
+  fi
+  v="$(sed -n 's/.*"address"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*/\1/p' "$file" | head -n1)"
+  if [ -n "$v" ]; then
+    echo "address|$v"
+    return 0
+  fi
+  echo "|"
+}
+
 get_outbound_domains() {
   local tag="$1" f
   if [ -f "${OUTBOUNDS_DIR}/${tag}.json" ]; then
@@ -2120,7 +2191,7 @@ EOF
 }
 
 ensure_warp_variants() {
-  local base_file target_dir tmp tag
+  local base_file target_dir tmp tag field_mode field_raw resolved family esc
   if [ -f "${ENDPOINTS_DIR}/warp.json" ]; then
     base_file="${ENDPOINTS_DIR}/warp.json"
     target_dir="${ENDPOINTS_DIR}"
@@ -2130,9 +2201,28 @@ ensure_warp_variants() {
   else
     return 1
   fi
+  IFS='|' read -r field_mode field_raw <<< "$(get_warp_endpoint_field "$base_file")"
   for tag in warp4 warp6; do
     tmp="$(tmp_path ${tag}.json)"
     sed '0,/"tag"[[:space:]]*:[[:space:]]*"warp"/s//"tag": "'"${tag}"'"/' "$base_file" > "$tmp"
+    if [ -n "$field_mode" ] && [ -n "$field_raw" ]; then
+      if [ "$tag" = "warp4" ]; then
+        family="4"
+      else
+        family="6"
+      fi
+      resolved="$(warp_endpoint_host_for_family "$field_raw" "$family" || true)"
+      if [ -n "$resolved" ]; then
+        esc="$(printf '%s' "$resolved" | sed 's/[\\/&]/\\&/g')"
+        sed -i "0,/\"${field_mode}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/s//\"${field_mode}\": \"${esc}\"/" "$tmp"
+      else
+        if [ "$family" = "4" ]; then
+          ui "提示: WARP IPv4 未解析到 IPv4 端点，${tag} 将使用自动地址族。"
+        else
+          ui "提示: WARP IPv6 未解析到 IPv6 端点，${tag} 将使用自动地址族。"
+        fi
+      fi
+    fi
     mv "$tmp" "${target_dir}/${tag}.json"
   done
 }
