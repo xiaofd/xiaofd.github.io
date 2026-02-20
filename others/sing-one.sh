@@ -195,11 +195,11 @@ install_deps() {
   ensure_tmp_dir
   if is_alpine; then
     cmd_exists apk || die "未找到 apk，无法安装依赖。"
-    apk add --no-cache curl ca-certificates logrotate openssl cronie
+    apk add --no-cache curl ca-certificates logrotate
     return 0
   fi
   apt-get update -y
-  apt-get install -y curl ca-certificates logrotate openssl cron
+  apt-get install -y --no-install-recommends curl ca-certificates logrotate
 }
 
 detect_arch_singbox() {
@@ -687,11 +687,11 @@ ensure_hy2_cert() {
   if [ -s "$HY2_CERT" ] && [ -s "$HY2_KEY" ]; then
     return 0
   fi
+  ensure_openssl_dependency || die "未找到 openssl，无法生成/申请 HY2 证书。"
   if [ "${HY2_CERT_MODE:-self}" = "acme" ]; then
     issue_hy2_acme_cert
     return 0
   fi
-  cmd_exists openssl || die "未找到 openssl，无法生成 HY2 证书。"
   msg "生成 Hysteria2 自签证书..."
   openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
     -subj "/CN=${SERVER_NAME}" \
@@ -708,7 +708,7 @@ ensure_cron_dependency() {
     apk add --no-cache cronie >/dev/null 2>&1 || true
   else
     apt-get update -y >/dev/null 2>&1 || true
-    DEBIAN_FRONTEND=noninteractive apt-get install -y cron >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cron >/dev/null 2>&1 || true
   fi
   if ! cmd_exists crontab; then
     ui "未检测到 crontab，将继续使用 acme.sh --force 安装模式。"
@@ -721,6 +721,20 @@ ensure_cron_dependency() {
     rc-service crond start >/dev/null 2>&1 || true
   fi
   return 0
+}
+
+ensure_openssl_dependency() {
+  if cmd_exists openssl; then
+    return 0
+  fi
+  msg "安装 openssl 依赖中..."
+  if is_alpine; then
+    apk add --no-cache openssl >/dev/null 2>&1 || true
+  else
+    apt-get update -y >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssl >/dev/null 2>&1 || true
+  fi
+  cmd_exists openssl
 }
 
 ensure_acme_sh() {
@@ -2059,6 +2073,7 @@ setup_warp() {
 
   local endpoint_host endpoint_port
   IFS='|' read -r endpoint_host endpoint_port <<< "$(parse_hostport "$endpoint")"
+  [ -z "$endpoint_host" ] && endpoint_host="engage.cloudflareclient.com"
   if [ -z "$endpoint_port" ]; then
     endpoint_port="2408"
   fi

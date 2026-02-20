@@ -168,7 +168,7 @@ install_deps() {
     return 0
   fi
   apt-get update -y
-  apt-get install -y curl unzip ca-certificates logrotate
+  apt-get install -y --no-install-recommends curl unzip ca-certificates logrotate
 }
 
 detect_arch_xray() {
@@ -315,6 +315,7 @@ restart_xray() {
     systemctl enable xray >/dev/null 2>&1 || true
     systemctl restart xray
   elif openrc_available; then
+    write_openrc_service
     rc-service xray restart
   else
     stop_xray
