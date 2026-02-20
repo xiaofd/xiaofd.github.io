@@ -2247,7 +2247,7 @@ ensure_warp_variants() {
   fi
   for tag in warp4 warp6; do
     tmp="$(tmp_path ${tag}.json)"
-    sed '0,/"tag"[[:space:]]*:[[:space:]]*"warp"/s//"tag": "'"${tag}"'"/' "$base_file" > "$tmp"
+    sed '/"tag"[[:space:]]*:[[:space:]]*"warp"/s//"tag": "'"${tag}"'"/' "$base_file" > "$tmp"
     if [ -n "$field_mode" ] && [ -n "$field_raw" ]; then
       if [ "$tag" = "warp4" ]; then
         family="4"
@@ -2257,7 +2257,7 @@ ensure_warp_variants() {
       resolved="$(warp_endpoint_host_for_family "$field_raw" "$family" || true)"
       if [ -n "$resolved" ]; then
         esc="$(printf '%s' "$resolved" | sed 's/[\\/&]/\\&/g')"
-        sed -i "0,/\"${field_mode}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/s//\"${field_mode}\": \"${esc}\"/" "$tmp"
+        sed -i "/\"${field_mode}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/s//\"${field_mode}\": \"${esc}\"/" "$tmp"
       else
         if [ "$family" = "4" ]; then
           ui "提示: WARP IPv4 未解析到 IPv4 端点，${tag} 将使用自动地址族。"
@@ -2438,6 +2438,12 @@ add_custom_outbound() {
       ui "标签无效。"
       continue
     fi
+    case "$tag" in
+      direct4|direct6|warp|warp4|warp6)
+        ui "该标签为系统保留，请换一个。"
+        continue
+        ;;
+    esac
     if [ -f "${OUTBOUNDS_DIR}/${tag}.json" ] || [ -f "${ENDPOINTS_DIR}/${tag}.json" ]; then
       ui "标签已存在。"
       continue

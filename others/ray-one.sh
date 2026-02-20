@@ -1674,18 +1674,18 @@ ensure_warp_variants() {
   ep6_esc="$(printf '%s' "$ep6" | sed 's/[\\/&]/\\&/g')"
 
   tmp="$(tmp_path warp4.json)"
-  sed '0,/"tag"[[:space:]]*:[[:space:]]*"warp"/s//"tag": "warp4"/' "${OUTBOUNDS_DIR}/warp.json" \
-    | sed "0,/\"endpoint\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/s//\"endpoint\": \"${ep4_esc}\"/" > "$tmp"
+  sed '/"tag"[[:space:]]*:[[:space:]]*"warp"/s//"tag": "warp4"/' "${OUTBOUNDS_DIR}/warp.json" \
+    | sed "/\"endpoint\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/s//\"endpoint\": \"${ep4_esc}\"/" > "$tmp"
   if [ "$force4" -eq 1 ]; then
-    sed -i '0,/"settings"[[:space:]]*:[[:space:]]*{/s//"settings": {\n    "domainStrategy": "ForceIPv4",/' "$tmp"
+    sed -i '/"settings"[[:space:]]*:[[:space:]]*{/s//"settings": {\n    "domainStrategy": "ForceIPv4",/' "$tmp"
   fi
   mv "$tmp" "${OUTBOUNDS_DIR}/warp4.json"
 
   tmp="$(tmp_path warp6.json)"
-  sed '0,/"tag"[[:space:]]*:[[:space:]]*"warp"/s//"tag": "warp6"/' "${OUTBOUNDS_DIR}/warp.json" \
-    | sed "0,/\"endpoint\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/s//\"endpoint\": \"${ep6_esc}\"/" > "$tmp"
+  sed '/"tag"[[:space:]]*:[[:space:]]*"warp"/s//"tag": "warp6"/' "${OUTBOUNDS_DIR}/warp.json" \
+    | sed "/\"endpoint\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/s//\"endpoint\": \"${ep6_esc}\"/" > "$tmp"
   if [ "$force6" -eq 1 ]; then
-    sed -i '0,/"settings"[[:space:]]*:[[:space:]]*{/s//"settings": {\n    "domainStrategy": "ForceIPv6",/' "$tmp"
+    sed -i '/"settings"[[:space:]]*:[[:space:]]*{/s//"settings": {\n    "domainStrategy": "ForceIPv6",/' "$tmp"
   fi
   mv "$tmp" "${OUTBOUNDS_DIR}/warp6.json"
 }
@@ -1864,6 +1864,12 @@ add_custom_outbound() {
       ui "标签无效。"
       continue
     fi
+    case "$tag" in
+      direct4|direct6|warp|warp4|warp6)
+        ui "该标签为系统保留，请换一个。"
+        continue
+        ;;
+    esac
     if [ -f "${OUTBOUNDS_DIR}/${tag}.json" ]; then
       ui "标签已存在。"
       continue
