@@ -637,15 +637,37 @@ EOF
   "$XRAY_BIN" run -c "$cfg" >"$logf" 2>&1 &
   pid=$!
   wait_port_listen "$port" || true
-  ip="$(curl -fsSL --max-time 8 --socks5-hostname 127.0.0.1:${port} https://ip.sb 2>/dev/null || true)"
+  ip="$(probe_socks_outbound_ip "$port" || true)"
   kill "$pid" >/dev/null 2>&1 || true
   wait "$pid" >/dev/null 2>&1 || true
   rm -f "$cfg" "$logf"
   if [ -n "$ip" ]; then
     msg "出口 ${tag} 测试成功，出口 IP: ${ip}"
   else
-    ui "出口 ${tag} 测试失败（无法访问 ip.sb）"
+    ui "出口 ${tag} 测试失败（探测源不可达或返回非 IP）"
   fi
+}
+
+probe_socks_outbound_ip() {
+  local port="$1" tries url raw ip
+  for tries in 1 2; do
+    for url in \
+      "https://api.ip.sb/ip" \
+      "https://ip.sb" \
+      "https://api.ipify.org" \
+      "https://ifconfig.me/ip" \
+      "https://ipv4.icanhazip.com"; do
+      raw="$(curl -fsSL --connect-timeout 4 --max-time 10 --proxy "socks5h://127.0.0.1:${port}" "$url" 2>/dev/null || \
+             curl -fsSL --connect-timeout 4 --max-time 10 --socks5-hostname "127.0.0.1:${port}" "$url" 2>/dev/null || true)"
+      ip="$(printf '%s' "$raw" | awk 'NF{gsub(/\r/,"",$0); gsub(/[[:space:]]+/,"",$0); print; exit}')"
+      if [ -n "$ip" ] && is_ip_addr "$ip"; then
+        echo "$ip"
+        return 0
+      fi
+    done
+    sleep 1
+  done
+  return 1
 }
 
 prompt_port() {
