@@ -455,11 +455,10 @@ prepare_mount_plan(){
 
   SERVICE_NAME="rclone-mount-${REMOTE_NAME}-${SUFFIX}"
   SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-  LOG_FILE="/var/log/${SERVICE_NAME}.log"
+  LOG_FILE="journald"
   CACHE_DIR="${CACHE_ROOT}/${REMOTE_NAME}-${SUFFIX}"
 
   mkdir -p "$CACHE_DIR"
-  touch "$LOG_FILE" >/dev/null 2>&1 || true
 
   # 特性探测：以“实际挂载的 remote”判断
   local FEAT_TOP
@@ -534,8 +533,15 @@ prepare_mount_plan(){
   # Drive 专项（依据物理底层）
   [[ "$PHYSICAL_TYPE" == "drive" ]] && OPTS+=( "--drive-pacer-min-sleep" "10ms" ) || true
 
-  # systemd ExecStart（逐参数 quote）
-  CMD_STR="$(quote_args_for_systemd "$RCLONE_BIN" "mount" "$REMOTE_SPEC" "$LOCAL_MOUNT_POINT" "${OPTS[@]}" "--log-file" "$LOG_FILE")"
+  # 强制清除可能被误加的 --daemon（systemd Type=notify 必须前台运行）
+  local -a FINAL_OPTS=()
+  for opt in "${OPTS[@]}"; do
+    [[ "$opt" == "--daemon" ]] && continue
+    FINAL_OPTS+=("$opt")
+  done
+
+  # systemd ExecStart（逐参数 quote，使用 --log-systemd 取代 --log-file）
+  CMD_STR="$(quote_args_for_systemd "$RCLONE_BIN" "mount" "$REMOTE_SPEC" "$LOCAL_MOUNT_POINT" "${FINAL_OPTS[@]}" "--log-systemd")"
 
   # 额外：为公示打印 MAX_SIZE 需要
   PLAN_MAX_SIZE="$MAX_SIZE"
@@ -563,7 +569,7 @@ install_mount(){
   [[ "$READ_ONLY" == "yes" ]] && say "🔒 只读：     是（--read-only）" || say "🔒 只读：     否"
   [[ "$NO_CHECKSUM" == "yes" ]] && say "🧾 校验：     关闭 checksum（无 Hashes 支持）" || say "🧾 校验：     默认"
   say "🧩 Service：  ${BOLD}${SERVICE_NAME}${PLAIN}"
-  say "📜 LogFile：  ${BOLD}${LOG_FILE}${PLAIN}"
+  say "📜 Logging：  ${BOLD}journald (使用 journalctl -u ${SERVICE_NAME} 查看)${PLAIN}"
   hr
   say
   read -p "确认写入 systemd 并启动该挂载？(y/n): " CONFIRM
@@ -622,11 +628,11 @@ EOF
 
   if service_active "$SERVICE_NAME" && is_mountpoint_exact "$LOCAL_MOUNT_POINT" && ! is_stale_mount "$LOCAL_MOUNT_POINT"; then
     ok "挂载成功：$LOCAL_MOUNT_POINT"
-    info "查看日志：tail -f \"$LOG_FILE\""
+    info "查看日志：journalctl -u \"$SERVICE_NAME\" -f"
   else
     err "挂载未达到健康状态（可能网络/认证/API/权限）。"
     systemctl status "$SERVICE_NAME" --no-pager || true
-    info "日志：tail -n 120 \"$LOG_FILE\""
+    info "日志：journalctl -u \"$SERVICE_NAME\" -n 120 --no-pager"
   fi
 }
 
@@ -642,7 +648,7 @@ dry_run(){
   say "📍 MountPoint： ${BOLD}${LOCAL_MOUNT_POINT}${PLAIN}"
   say "🧊 VFS cache：  ${BOLD}${VFS_CACHE_MODE:-full}${PLAIN}"
   say "💾 cache-dir：  ${BOLD}${CACHE_DIR}${PLAIN}"
-  say "📜 log-file：   ${BOLD}${LOG_FILE}${PLAIN}"
+  say "📜 logging：    ${BOLD}journald${PLAIN}"
   if [[ "$SUPPORT_POLL" == "yes" ]]; then
     say "🛰️ 目录更新： 支持 polling(ChangeNotify) → poll=15s, dir-cache=24h"
   else
@@ -834,8 +840,7 @@ restart_one_mount(){
   else
     err "重启后仍未达到健康状态。"
     systemctl status "$svc" --no-pager || true
-    local logf; logf="$(meta_get "$PICK_FILE" "LogFile")"
-    [[ -n "${logf:-}" ]] && info "日志：tail -n 120 \"$logf\""
+    info "日志：journalctl -u \"$svc\" -n 120 --no-pager"
   fi
 }
 
@@ -940,7 +945,7 @@ modify_one_mount(){
   old_rpath="$(meta_get "$unit" "RemotePath")"
   old_mp="$(meta_get "$unit" "MountPoint")"
   old_cache="$(meta_get "$unit" "CacheDir")"
-  old_log="$(meta_get "$unit" "LogFile")"
+  old_log="journald"
   old_vfs_mode="$(meta_get "$unit" "VfsCacheMode")"
   old_exec="$(unit_execstart_get "$unit")"
 
@@ -958,7 +963,6 @@ modify_one_mount(){
 
   [[ -n "${old_mp:-}" ]] || old_mp="$(execstart_mountpoint_get "$old_exec" || true)"
   [[ -n "${old_mp:-}" ]] || old_mp="$PICK_MP"
-  [[ -n "${old_log:-}" ]] || old_log="/var/log/${svc}.log"
   [[ -n "${old_cache:-}" ]] || old_cache="/var/cache/rclone/${svc}"
   if [[ -z "${old_vfs_mode:-}" ]]; then
     old_vfs_mode="$(execstart_flag_value "$old_exec" "--vfs-cache-mode" || true)"
@@ -1046,8 +1050,7 @@ modify_one_mount(){
   fi
   mkdir -p "$CACHE_DIR"
 
-  LOG_FILE="$old_log"
-  touch "$LOG_FILE" >/dev/null 2>&1 || true
+  LOG_FILE="journald"
 
   local calc out_avail_kb MAX_SIZE
   calc="$(calc_cache_max_size "$CACHE_DIR")"
@@ -1082,7 +1085,14 @@ modify_one_mount(){
   [[ "$NO_CHECKSUM" == "yes" ]] && OPTS+=( "--no-checksum" ) || true
   [[ "$PHYSICAL_TYPE" == "drive" ]] && OPTS+=( "--drive-pacer-min-sleep" "10ms" ) || true
 
-  CMD_STR="$(quote_args_for_systemd "$RCLONE_BIN" "mount" "$REMOTE_SPEC" "$LOCAL_MOUNT_POINT" "${OPTS[@]}" "--log-file" "$LOG_FILE")"
+  # 强制清除可能被误加的 --daemon（systemd Type=notify 必须前台运行）
+  local -a FINAL_OPTS=()
+  for opt in "${OPTS[@]}"; do
+    [[ "$opt" == "--daemon" ]] && continue
+    FINAL_OPTS+=("$opt")
+  done
+
+  CMD_STR="$(quote_args_for_systemd "$RCLONE_BIN" "mount" "$REMOTE_SPEC" "$LOCAL_MOUNT_POINT" "${FINAL_OPTS[@]}" "--log-systemd")"
 
   hr
   say "${BOLD}将更新该挂载：${svc}${PLAIN}"
@@ -1090,7 +1100,7 @@ modify_one_mount(){
   say "📍 MountPoint： ${BOLD}${LOCAL_MOUNT_POINT}${PLAIN}"
   say "🧊 VFS cache： ${BOLD}${new_vfs_mode}${PLAIN}"
   say "💾 CacheDir：  ${BOLD}${CACHE_DIR}${PLAIN}"
-  say "📜 LogFile：   ${BOLD}${LOG_FILE}${PLAIN}"
+  say "📜 Logging：   ${BOLD}journald (使用 journalctl -u ${svc} 查看)${PLAIN}"
   hr
   say "${BOLD}新的 ExecStart：${PLAIN}"
   say "${CMD_STR}"
@@ -1164,7 +1174,7 @@ EOF
   else
     err "修改后未达到健康状态。"
     systemctl status "$svc" --no-pager || true
-    info "日志：tail -n 120 \"$LOG_FILE\""
+    info "日志：journalctl -u \"$svc\" -n 120 --no-pager"
   fi
 
   if [[ "$use_new_cache" == "y" && -n "${old_cache:-}" && "$old_cache" != "$CACHE_DIR" && -d "$old_cache" ]]; then
